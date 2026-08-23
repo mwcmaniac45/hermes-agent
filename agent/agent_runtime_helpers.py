@@ -3803,6 +3803,49 @@ def sanitize_api_messages(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]
             "Pre-call sanitizer: removed %d duplicate tool_call_id reference(s)",
             removed_dupes,
         )
+
+    # 4. Align each tool result's wire-visible name with the assistant
+    # function call it answers. Tool Search deliberately unwraps bridge calls
+    # such as ``tool_call`` to an internal MCP/plugin name for execution,
+    # logging, hooks, and guardrails. That internal name is retained in
+    # ``tool_name``, but it is not the function name the model called. Gemini
+    # 3.x strictly matches function response id/name/count and rejects a
+    # mismatched name; provider-agnostic normalization also keeps every other
+    # OpenAI-compatible request internally consistent.
+    #
+    # Walk in transcript order rather than building one global id->name map:
+    # some local servers legitimately reuse one tool_call_id across turns, so
+    # a global map would rewrite every earlier result to the final call's name.
+    pending_call_names: Dict[str, str] = {}
+    realigned: List[Tuple[str, str]] = []
+    aligned: List[Dict[str, Any]] = []
+    for msg in messages:
+        role = msg.get("role")
+        if role == "assistant":
+            for tc in msg.get("tool_calls") or []:
+                cid = _ra().AIAgent._get_tool_call_id_static(tc)
+                name = _ra().AIAgent._get_tool_call_name_static(tc)
+                if cid and name:
+                    pending_call_names[cid] = name
+        elif role == "tool":
+            cid = (msg.get("tool_call_id") or "").strip()
+            expected = pending_call_names.pop(cid, None)
+            current = msg.get("name")
+            # ``name`` is optional in the OpenAI wire shape. Only repair a
+            # present mismatch; do not perturb clean unnamed histories or
+            # their prompt-cache prefix.
+            if expected and current and current != expected:
+                msg = {**msg, "name": expected}
+                realigned.append((str(current), expected))
+        aligned.append(msg)
+    if realigned:
+        messages = aligned
+        _ra().logger.debug(
+            "Pre-call sanitizer: realigned %d tool result name(s) with their "
+            "tool-call function name (%s)",
+            len(realigned),
+            ", ".join(f"{old} -> {new}" for old, new in realigned),
+        )
     return messages
 
 

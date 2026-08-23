@@ -456,6 +456,65 @@ def test_sanitize_drops_result_with_no_preceding_call():
     assert [m for m in out if m.get("role") == "tool"] == []
 
 
+def test_sanitize_realigns_bridged_tool_result_name_with_call_name():
+    """Wire-visible result names must echo the assistant function call."""
+    from agent.agent_runtime_helpers import sanitize_api_messages
+
+    messages = [
+        {"role": "user", "content": "inspect Figma access"},
+        {"role": "assistant", "content": None,
+         "tool_calls": [{"id": "call_1", "type": "function",
+                         "function": {
+                             "name": "tool_call",
+                             "arguments": '{"name":"mcp__figma__whoami"}',
+                         }}]},
+        {"role": "tool", "name": "mcp__figma__whoami",
+         "tool_name": "mcp__figma__whoami",
+         "tool_call_id": "call_1", "content": '{"user":"ok"}'},
+    ]
+
+    out = sanitize_api_messages(list(messages))
+    result = [m for m in out if m.get("role") == "tool"][0]
+
+    assert result["name"] == "tool_call"
+    assert result["tool_name"] == "mcp__figma__whoami"
+    assert messages[2]["name"] == "mcp__figma__whoami"
+
+
+def test_sanitize_does_not_invent_missing_tool_result_name():
+    """An unnamed OpenAI-format result remains byte-identical."""
+    from agent.agent_runtime_helpers import sanitize_api_messages
+
+    messages = [
+        {"role": "assistant", "content": None,
+         "tool_calls": [{"id": "call_1", "type": "function",
+                         "function": {"name": "terminal", "arguments": "{}"}}]},
+        {"role": "tool", "tool_call_id": "call_1", "content": "ok"},
+    ]
+
+    assert sanitize_api_messages(list(messages)) == messages
+
+
+def test_sanitize_aligns_names_per_turn_when_call_id_is_reused():
+    """A reused local call id must not bind every result to the last call."""
+    from agent.agent_runtime_helpers import sanitize_api_messages
+
+    messages = [
+        _call(CONSTANT_ID, name="first_bridge"),
+        {"role": "tool", "name": "mcp__one", "tool_call_id": CONSTANT_ID,
+         "content": "one"},
+        _call(CONSTANT_ID, name="second_bridge"),
+        {"role": "tool", "name": "mcp__two", "tool_call_id": CONSTANT_ID,
+         "content": "two"},
+    ]
+
+    out = sanitize_api_messages(list(messages))
+
+    assert [m["name"] for m in out if m.get("role") == "tool"] == [
+        "first_bridge", "second_bridge",
+    ]
+
+
 def test_sanitize_drops_empty_tool_calls_array():
     """sanitize_api_messages strips ``tool_calls: []`` from assistant messages.
 
