@@ -247,7 +247,12 @@ def _model_consumes_thought_signature(model: Any) -> bool:
     ``extra_content`` from earlier in a mixed-provider session.
     """
     m = str(model or "").lower()
-    return "gemini" in m or "gemma" in m
+    return "gemini" in m
+
+
+_GEMINI_UNSIGNED_TOOL_CALL_SENTINEL = {
+    "google": {"thought_signature": "skip_thought_signature_validator"}
+}
 
 
 class ChatCompletionsTransport(ProviderTransport):
@@ -296,9 +301,8 @@ class ChatCompletionsTransport(ProviderTransport):
           ``Extra inputs are not permitted, field: 'messages[N]._empty_recovery_synthetic'``,
           which then poisons every subsequent request in the session.
         """
-        strip_extra_content = not _model_consumes_thought_signature(
-            kwargs.get("model")
-        )
+        needs_thought_signature = _model_consumes_thought_signature(kwargs.get("model"))
+        strip_extra_content = not needs_thought_signature
         needs_sanitize = False
         for msg in messages:
             if not isinstance(msg, dict):
@@ -342,6 +346,7 @@ class ChatCompletionsTransport(ProviderTransport):
                         "call_id" in tc
                         or "response_item_id" in tc
                         or (strip_extra_content and "extra_content" in tc)
+                        or (needs_thought_signature and "extra_content" not in tc)
                     ):
                         needs_sanitize = True
                         break
@@ -422,6 +427,7 @@ class ChatCompletionsTransport(ProviderTransport):
                             "call_id" in tc
                             or "response_item_id" in tc
                             or (strip_extra_content and "extra_content" in tc)
+                            or (needs_thought_signature and "extra_content" not in tc)
                         )
                         if should_copy_tc:
                             if copied_tool_calls is None:
@@ -431,6 +437,12 @@ class ChatCompletionsTransport(ProviderTransport):
                             copied_tc.pop("response_item_id", None)
                             if strip_extra_content:
                                 copied_tc.pop("extra_content", None)
+                            elif "extra_content" not in copied_tc:
+                                # Google documents this sentinel for replaying
+                                # function calls injected by another model/API.
+                                copied_tc["extra_content"] = (
+                                    _GEMINI_UNSIGNED_TOOL_CALL_SENTINEL
+                                )
                             copied_tool_calls[tc_idx] = copied_tc
                 if copied_tool_calls is not None:
                     mutable_msg()["tool_calls"] = copied_tool_calls

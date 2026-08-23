@@ -116,6 +116,42 @@ class TestChatCompletionsBasic:
                              "function": {"name": "t", "arguments": "{}"}}]},
         ]
 
+    def test_convert_messages_adds_sentinel_for_unsigned_gemini_tool_call(
+        self, transport
+    ):
+        """Cross-provider tool history must remain replayable by Gemini 3."""
+        msgs = [
+            {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [
+                    {
+                        "id": "call_1",
+                        "type": "function",
+                        "function": {"name": "lookup", "arguments": "{}"},
+                    }
+                ],
+            }
+        ]
+
+        result = transport.convert_messages(msgs, model="google/gemini-3.7-flash")
+
+        assert result[0]["tool_calls"][0]["extra_content"] == {
+            "google": {
+                "thought_signature": "skip_thought_signature_validator",
+            }
+        }
+        assert "extra_content" not in msgs[0]["tool_calls"][0]
+
+    def test_convert_messages_strips_gemini_signature_for_gemma(self, transport):
+        """Gemma does not implement Gemini's thought-signature contract."""
+        msgs = self._msg_with_extra_content()
+
+        result = transport.convert_messages(msgs, model="google/gemma-3-27b-it")
+
+        assert "extra_content" not in result[0]["tool_calls"][0]
+        assert "extra_content" in msgs[0]["tool_calls"][0]
+
 
 
 
