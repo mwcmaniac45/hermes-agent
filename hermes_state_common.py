@@ -524,6 +524,39 @@ CREATE INDEX IF NOT EXISTS idx_session_model_usage_session ON session_model_usag
 CREATE INDEX IF NOT EXISTS idx_session_model_usage_model ON session_model_usage(model);
 CREATE INDEX IF NOT EXISTS idx_async_delegations_delivery
     ON async_delegations(delivery_state, completed_at);
+
+-- PROVENANCE_UNVERIFIED: profile-local prompt receipt/outbox, never state_meta.
+CREATE TABLE IF NOT EXISTS prompt_submission_receipts (
+    session_id TEXT NOT NULL,
+    submission_id TEXT NOT NULL,
+    contract_version TEXT NOT NULL,
+    semantic_fingerprint TEXT NOT NULL,
+    work_id TEXT NOT NULL UNIQUE,
+    safe_ack_json TEXT NOT NULL,
+    created_at REAL NOT NULL,
+    updated_at REAL NOT NULL,
+    PRIMARY KEY (session_id, submission_id)
+);
+CREATE TABLE IF NOT EXISTS prompt_accepted_work (
+    work_id TEXT PRIMARY KEY,
+    session_id TEXT NOT NULL,
+    submission_id TEXT NOT NULL,
+    payload_json TEXT NOT NULL,
+    state TEXT NOT NULL,
+    owner_token TEXT,
+    owner_generation INTEGER NOT NULL DEFAULT 0,
+    lease_expires_at REAL,
+    invocation_attempt_token TEXT,
+    invocation_attempt_no INTEGER NOT NULL DEFAULT 0,
+    safe_terminal_json TEXT,
+    created_at REAL NOT NULL,
+    updated_at REAL NOT NULL,
+    UNIQUE (session_id, submission_id),
+    FOREIGN KEY (session_id, submission_id)
+      REFERENCES prompt_submission_receipts(session_id, submission_id)
+);
+CREATE INDEX IF NOT EXISTS idx_prompt_accepted_work_recovery
+    ON prompt_accepted_work(state, lease_expires_at, created_at);
 """
 
 
