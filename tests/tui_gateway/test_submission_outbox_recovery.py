@@ -181,7 +181,8 @@ def test_real_sessiondb_barrier_race_replays_same_fingerprint_once(tmp_path):
     entered, release = threading.Event(), threading.Event()
     first = _db_with_session(path)
     second = SessionDB(db_path=path)
-    results = []
+    results, replay = [], []
+    thread = second_writer = second_conn = None
 
     def first_writer():
         results.append(first.create_or_read_prompt_submission(
@@ -190,22 +191,51 @@ def test_real_sessiondb_barrier_race_replays_same_fingerprint_once(tmp_path):
             before_commit=lambda: (entered.set(), release.wait(2)),
         ))
 
-    thread = threading.Thread(target=first_writer)
-    thread.start()
-    assert entered.wait(2)
-    replay = []
-    second_writer = threading.Thread(target=lambda: replay.append(second.create_or_read_prompt_submission(
-        session_id="stored-session", submission_id="race-1", contract_version="1",
-        semantic_fingerprint="c" * 64, payload={"text": "private"},
-    )))
-    second_writer.start()
-    release.set(); thread.join(3); second_writer.join(3)
-    assert [result["created"] for result in results + replay].count(True) == 1
-    assert [result["created"] for result in results + replay].count(False) == 1
-    assert replay[0]["conflict"] is False
-    assert results[0]["work_id"] == replay[0]["work_id"]
-    assert first.prompt_submission_counts("stored-session") == (1, 1)
-    first.close(); second.close()
+    try:
+        thread = threading.Thread(target=first_writer)
+        thread.start()
+        assert entered.wait(2)
+
+        # The trace callback runs as the second connection dispatches its real
+        # BEGIN IMMEDIATE, before SQLite can acquire the first writer's lock.
+        second_begin_attempted = threading.Event()
+
+        def trace_second_begin(statement):
+            if statement == "BEGIN IMMEDIATE":
+                second_begin_attempted.set()
+
+        second_conn = second._conn
+        assert second_conn is not None
+        second_conn.set_trace_callback(trace_second_begin)
+        second_writer = threading.Thread(target=lambda: replay.append(second.create_or_read_prompt_submission(
+            session_id="stored-session", submission_id="race-1", contract_version="1",
+            semantic_fingerprint="c" * 64, payload={"text": "private"},
+        )))
+        second_writer.start()
+        assert second_begin_attempted.wait(2), "second writer never attempted BEGIN IMMEDIATE while first was held"
+        release.set()
+        thread.join(3)
+        second_writer.join(3)
+
+        assert not thread.is_alive()
+        assert not second_writer.is_alive()
+        all_results = results + replay
+        assert len(all_results) == 2
+        assert [result["created"] for result in all_results].count(True) == 1
+        assert [result["created"] for result in all_results].count(False) == 1
+        assert all(result["conflict"] is False for result in all_results)
+        assert results[0]["work_id"] == replay[0]["work_id"]
+        assert first.prompt_submission_counts("stored-session") == (1, 1)
+    finally:
+        release.set()
+        if thread is not None:
+            thread.join(3)
+        if second_writer is not None:
+            second_writer.join(3)
+        if second_conn is not None:
+            second_conn.set_trace_callback(None)
+        first.close()
+        second.close()
 
 
 def test_commit_before_runtime_admission_recovers_once_after_fresh_db_resume(tmp_path):
