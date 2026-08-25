@@ -2563,6 +2563,35 @@ def _cleanup_durable_preinvocation_projection(session: dict, work_id: str, owner
                 session.pop("inflight_turn", None)
 
 
+def _refuse_durable_preprovider_projection(
+    sid: str,
+    session: dict,
+    durable_context: dict[str, Any],
+    *,
+    started: bool,
+    invocation_started: bool,
+) -> None:
+    """Owner-fence a refused projection before any provider call can begin."""
+    if invocation_started and durable_context.get("attempt_token"):
+        _settle_durable_terminal(session, durable_context, state="TERMINAL_ERROR")
+        with session["history_lock"]:
+            if session.get("_durable_projection_work_id") == durable_context["work_id"]:
+                session.pop("_durable_projection_work_id", None)
+                session["running"] = False
+                inflight = session.get("inflight_turn")
+                if isinstance(inflight, dict) and inflight.get("durable_work_id") == durable_context["work_id"]:
+                    session.pop("inflight_turn", None)
+    else:
+        _cleanup_durable_preinvocation_projection(
+            session, durable_context["work_id"], durable_context["owner_token"]
+        )
+    if started:
+        _emit("message.complete", sid, {
+            "text": "", "status": "error", "error": "Durable submission failed.",
+            "recoverable": False,
+        })
+
+
 def _settle_durable_terminal(session: dict, durable_context: dict[str, Any], *, state: str) -> bool:
     safe_terminal = None if state == "COMPLETED" else {
         "layer": "provider" if state == "TERMINAL_ERROR" else "recovery",
@@ -2602,6 +2631,7 @@ def _schedule_durable_prompt_projection(session: dict, work_id: str) -> None:
 
     def dispatch() -> None:
         owner_token = str(uuid.uuid4())
+        durable_context: dict[str, Any] | None = None
         try:
             with _session_db(session) as db:
                 if db is None:
@@ -2611,6 +2641,11 @@ def _schedule_durable_prompt_projection(session: dict, work_id: str) -> None:
                 )
             if claim is None or claim.get("session_id") != sid:
                 return
+            durable_context = {
+                "work_id": work_id, "owner_token": owner_token,
+                "owner_generation": claim["owner_generation"],
+                "attempt_token": None, "session_id": sid,
+            }
             payload = claim.get("payload")
             if not isinstance(payload, dict) or (
                 payload.get("display_kind") != "normal" or payload.get("queued")
@@ -2619,29 +2654,37 @@ def _schedule_durable_prompt_projection(session: dict, work_id: str) -> None:
                 or payload.get("truncation_consent")
                 or not isinstance(payload.get("text"), str)
             ):
-                _cleanup_durable_preinvocation_projection(session, work_id, owner_token)
+                _refuse_durable_preprovider_projection(
+                    sid, session, durable_context, started=False, invocation_started=False
+                )
                 return
             with session["history_lock"]:
                 if session.get("running") or session.get("_closing") or session.get("session_key") != sid:
-                    _cleanup_durable_preinvocation_projection(session, work_id, owner_token)
+                    _refuse_durable_preprovider_projection(
+                        sid, session, durable_context, started=False, invocation_started=False
+                    )
                     return
                 session["running"] = True
                 session["_durable_projection_work_id"] = work_id
                 session["last_active"] = time.time()
             _start_agent_build(sid, session)
             if _wait_agent_for_prompt(session, f"__durable__{work_id}", sid) is not None:
-                _cleanup_durable_preinvocation_projection(session, work_id, owner_token)
+                _refuse_durable_preprovider_projection(
+                    sid, session, durable_context, started=False, invocation_started=False
+                )
                 return
-            _run_prompt_submit(
+            if not _run_prompt_submit(
                 f"__durable__{work_id}", sid, session, payload["text"],
-                durable_context={
-                    "work_id": work_id, "owner_token": owner_token,
-                    "owner_generation": claim["owner_generation"],
-                    "attempt_token": None, "session_id": sid,
-                },
-            )
+                durable_context=durable_context,
+            ):
+                _refuse_durable_preprovider_projection(
+                    sid, session, durable_context, started=False, invocation_started=False
+                )
         except Exception:
-            _cleanup_durable_preinvocation_projection(session, work_id, owner_token)
+            if durable_context is not None:
+                _refuse_durable_preprovider_projection(
+                    sid, session, durable_context, started=False, invocation_started=False
+                )
             return
 
     threading.Thread(target=dispatch, daemon=True).start()
@@ -8079,7 +8122,7 @@ def _inflight_text(value: Any) -> str:
     return _content_display_text(value).strip()
 
 
-def _start_inflight_turn(session: dict, text: Any) -> None:
+def _start_inflight_turn(session: dict, text: Any, *, durable_work_id: str | None = None) -> None:
     now = time.time()
     session["inflight_turn"] = {
         "assistant": "",
@@ -8088,6 +8131,8 @@ def _start_inflight_turn(session: dict, text: Any) -> None:
         "updated_at": now,
         "user": _inflight_text(text),
     }
+    if durable_work_id:
+        session["inflight_turn"]["durable_work_id"] = durable_work_id
 
 
 def _append_inflight_delta(session: dict, delta: Any) -> None:
@@ -10967,13 +11012,23 @@ def _run_prompt_submit(
 ) -> bool:
     with session["history_lock"]:
         if session.get("_closing"):
-            session["running"] = False
+            if durable_context is not None:
+                _refuse_durable_preprovider_projection(
+                    sid, session, durable_context, started=False, invocation_started=False
+                )
+            else:
+                session["running"] = False
             return False
         if (
             queued_prompt_generation is not None
             and int(session.get("_queued_prompt_generation", 0)) != queued_prompt_generation
         ):
-            session["running"] = False
+            if durable_context is not None:
+                _refuse_durable_preprovider_projection(
+                    sid, session, durable_context, started=False, invocation_started=False
+                )
+            else:
+                session["running"] = False
             return False
         if image_paths is None:
             images = list(session.get("attached_images", []))
@@ -10984,7 +11039,10 @@ def _run_prompt_submit(
         # A retained failed turn (see _fail_inflight_turn) is a stale leftover
         # by the time a new turn starts — replace it, never append onto it.
         if not isinstance(inflight, dict) or inflight.get("status") == "error":
-            _start_inflight_turn(session, text)
+            _start_inflight_turn(
+                session, text,
+                durable_work_id=durable_context["work_id"] if durable_context is not None else None,
+            )
         agent = session["agent"]
         if hasattr(agent, "clear_interrupt"):
             try:
@@ -11315,13 +11373,13 @@ def _run_prompt_submit(
                             attempt_token=attempt_token,
                         )
                 except Exception:
-                    _cleanup_durable_preinvocation_projection(
-                        session, durable_context["work_id"], durable_context["owner_token"]
+                    _refuse_durable_preprovider_projection(
+                        sid, session, durable_context, started=True, invocation_started=False
                     )
                     return
                 if invoking is None:
-                    _cleanup_durable_preinvocation_projection(
-                        session, durable_context["work_id"], durable_context["owner_token"]
+                    _refuse_durable_preprovider_projection(
+                        sid, session, durable_context, started=True, invocation_started=False
                     )
                     return
                 durable_context["attempt_token"] = attempt_token
@@ -11332,10 +11390,14 @@ def _run_prompt_submit(
                             attempt_token=attempt_token,
                         )
                 except Exception:
-                    _settle_durable_terminal(session, durable_context, state="TERMINAL_ERROR")
+                    _refuse_durable_preprovider_projection(
+                        sid, session, durable_context, started=True, invocation_started=True
+                    )
                     return
                 if not running:
-                    _settle_durable_terminal(session, durable_context, state="TERMINAL_ERROR")
+                    _refuse_durable_preprovider_projection(
+                        sid, session, durable_context, started=True, invocation_started=True
+                    )
                     return
                 lease_stop = threading.Event()
 
@@ -12014,8 +12076,13 @@ def _run_prompt_submit(
             session["_run_thread"] = run_thread
             run_thread.start()
     if not can_start:
-        with session["history_lock"]:
-            session["running"] = False
+        if durable_context is not None:
+            _refuse_durable_preprovider_projection(
+                sid, session, durable_context, started=True, invocation_started=False
+            )
+        else:
+            with session["history_lock"]:
+                session["running"] = False
     return can_start
 
 

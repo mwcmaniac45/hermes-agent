@@ -189,7 +189,10 @@ def test_scheduler_projects_real_accepted_work_to_completed_before_exact_replay(
     work = _work(db)
     db.close()
     session = _session(profile)
-    switches, provider_entries, emitted = [], [], []
+    ready = threading.Event()
+    ready.set()
+    session["agent_ready"] = ready
+    switches, provider_entries, emitted, marker_starts = [], [], [], []
 
     class InlineThread:
         def __init__(self, *, target, daemon):
@@ -207,20 +210,26 @@ def test_scheduler_projects_real_accepted_work_to_completed_before_exact_replay(
         model = "before"
         interim_assistant_callback = None
         def run_conversation(self, message, **_kwargs):
-            assert switches == ["applied"]
+            assert self.model == "after"
             provider_entries.append(message)
             return {"messages": [{"role": "user", "content": message}, {"role": "assistant", "content": "ok"}], "final_response": "ok"}
 
     session["agent"] = Agent()
+    session["pending_model_switch"] = {"raw": "after", "confirm_expensive_model": False}
+    def apply_switch(_sid, current, raw, **_kwargs):
+        assert raw == "after"
+        current["agent"].model = raw
+        switches.append(raw)
+        return {"value": raw, "warning": "", "confirm_required": False}
+
     monkeypatch.setattr(server.threading, "Thread", InlineThread)
-    monkeypatch.setattr(server, "_start_agent_build", lambda *_a: None)
-    monkeypatch.setattr(server, "_wait_agent_for_prompt", lambda *_a: None)
-    monkeypatch.setattr(server, "_apply_pending_model_switch", lambda *_a: switches.append("applied"))
+    monkeypatch.setattr(server, "_apply_model_switch", apply_switch)
     monkeypatch.setattr(server, "_sync_agent_model_with_config", lambda *_a: None)
     monkeypatch.setattr(server, "_sync_bot_capabilities", lambda *_a: None)
     monkeypatch.setattr(server, "_start_usage_ticker", lambda *_a: (threading.Event(), JoinedThread()))
     monkeypatch.setattr(server, "_get_usage", lambda *_a: {})
     monkeypatch.setattr(server, "_emit", lambda *a: emitted.append(a))
+    monkeypatch.setattr(server, "record_turn_start", lambda *a, **_k: marker_starts.append(a))
 
     server._schedule_durable_prompt_projection(session, work["work_id"])
 
@@ -231,11 +240,141 @@ def test_scheduler_projects_real_accepted_work_to_completed_before_exact_replay(
             semantic_fingerprint="a" * 64, payload={"text": "private text"},
         )
         assert replay["ack"]["invocation_status"] == "completed"
+        assert check._conn is not None
+        row = check._conn.execute(
+            "SELECT state, owner_token, invocation_attempt_token FROM prompt_accepted_work WHERE work_id=?",
+            (work["work_id"],),
+        ).fetchone()
+        assert tuple(row) == ("COMPLETED", None, row[2])
+        assert row[2]
     finally:
         check.close()
     assert provider_entries == ["private text"]
+    assert switches == ["after"]
+    assert "pending_model_switch" not in session
+    assert marker_starts == []
     assert not any(event[0] == "message.delta" for event in emitted)
     assert session["running"] is False
+
+
+@pytest.mark.parametrize(
+    ("transition", "raises"),
+    (("invoking", False), ("invoking", True), ("running", False), ("running", True)),
+)
+def test_scheduler_transition_refusal_clears_only_matching_durable_projection_and_completes_ui(
+    monkeypatch, tmp_path, transition, raises,
+):
+    profile = tmp_path / "profile"
+    profile.mkdir()
+    db = SessionDB(db_path=profile / "state.db")
+    db.create_session("session-a", "tui")
+    work = _work(db)
+    db.close()
+    session = _session(profile)
+    provider_entries, emitted = [], []
+
+    class InlineThread:
+        def __init__(self, *, target, daemon): self.target = target
+        def start(self): self.target()
+
+    class Agent:
+        session_id = "session-a"
+        provider = "test"
+        model = "test"
+        interim_assistant_callback = None
+        def run_conversation(self, *_a, **_k):
+            provider_entries.append(True)
+            return {"final_response": "unexpected"}
+
+    session["agent"] = Agent()
+    monkeypatch.setattr(server.threading, "Thread", InlineThread)
+    monkeypatch.setattr(server, "_start_agent_build", lambda *_a: None)
+    monkeypatch.setattr(server, "_wait_agent_for_prompt", lambda *_a: None)
+    monkeypatch.setattr(server, "_sync_agent_model_with_config", lambda *_a: None)
+    monkeypatch.setattr(server, "_sync_bot_capabilities", lambda *_a: None)
+    monkeypatch.setattr(server, "_emit", lambda *args: emitted.append(args))
+    if transition == "invoking":
+        if raises:
+            def refuse_invoking(*_a, **_k): raise RuntimeError("refused")
+            monkeypatch.setattr(SessionDB, "mark_prompt_submission_invoking", refuse_invoking)
+        else:
+            monkeypatch.setattr(SessionDB, "mark_prompt_submission_invoking", lambda *_a, **_k: None)
+    else:
+        if raises:
+            def refuse_running(*_a, **_k): raise RuntimeError("refused")
+            monkeypatch.setattr(SessionDB, "mark_prompt_submission_running", refuse_running)
+        else:
+            monkeypatch.setattr(SessionDB, "mark_prompt_submission_running", lambda *_a, **_k: False)
+
+    server._schedule_durable_prompt_projection(session, work["work_id"])
+
+    check = SessionDB(db_path=profile / "state.db")
+    try:
+        replay = check.create_or_read_prompt_submission(
+            session_id="session-a", submission_id="submission-a", contract_version="1",
+            semantic_fingerprint="a" * 64, payload={"text": "private text"},
+        )
+        assert replay["ack"]["invocation_status"] == (
+            "accepted" if transition == "invoking" else "terminal_error"
+        )
+    finally:
+        check.close()
+    assert provider_entries == []
+    assert session["running"] is False
+    assert not session.get("inflight_turn")
+    assert any(event[0] == "message.complete" and event[2]["status"] == "error" for event in emitted)
+
+
+@pytest.mark.parametrize("race", ("closing", "replacement"))
+def test_scheduler_preprovider_entry_races_release_claim_and_close_started_ui(monkeypatch, tmp_path, race):
+    profile = tmp_path / "profile"
+    profile.mkdir()
+    db = SessionDB(db_path=profile / "state.db")
+    db.create_session("session-a", "tui")
+    work = _work(db)
+    db.close()
+    session = _session(profile)
+    provider_entries, emitted = [], []
+
+    class InlineThread:
+        def __init__(self, *, target, daemon): self.target = target
+        def start(self): self.target()
+
+    class Agent:
+        session_id = "session-a"
+        provider = "test"
+        model = "test"
+        interim_assistant_callback = None
+        def run_conversation(self, *_a, **_k): provider_entries.append(True)
+
+    session["agent"] = Agent()
+    if race == "closing":
+        session["_closing"] = True
+    else:
+        server._sessions["session-a"] = {"replacement": True}
+    monkeypatch.setattr(server.threading, "Thread", InlineThread)
+    monkeypatch.setattr(server, "_start_agent_build", lambda *_a: None)
+    monkeypatch.setattr(server, "_wait_agent_for_prompt", lambda *_a: None)
+    monkeypatch.setattr(server, "_emit", lambda *args: emitted.append(args))
+    try:
+        server._schedule_durable_prompt_projection(session, work["work_id"])
+    finally:
+        server._sessions.pop("session-a", None)
+
+    check = SessionDB(db_path=profile / "state.db")
+    try:
+        replay = check.create_or_read_prompt_submission(
+            session_id="session-a", submission_id="submission-a", contract_version="1",
+            semantic_fingerprint="a" * 64, payload={"text": "private text"},
+        )
+        assert replay["ack"]["invocation_status"] == "accepted"
+    finally:
+        check.close()
+    assert provider_entries == []
+    assert session["running"] is False
+    assert not session.get("inflight_turn")
+    if race == "replacement":
+        assert any(event[0] == "message.complete" and event[2]["status"] == "error" for event in emitted)
 
 
 def test_scheduler_invalid_payload_releases_without_agent_or_provider(monkeypatch, tmp_path):
