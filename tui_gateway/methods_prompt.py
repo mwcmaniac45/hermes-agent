@@ -317,14 +317,8 @@ def _admit_id_bearing_prompt_submission(rid, params: dict, session: dict, text, 
     )
     if decision == "created":
         return None
-    if decision == "pending":
-        return _ok(rid, data)
     if decision == "existing":
-        return {
-            "jsonrpc": "2.0",
-            "id": rid,
-            **data,
-        }
+        return _ok(rid, data)
     return _err(rid, 4091, "submission id conflicts with prior request", data=data)
 
 

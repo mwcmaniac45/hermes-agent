@@ -2103,14 +2103,7 @@ def handle_request(req: dict) -> dict | None:
     fn = _methods.get(method)
     if not fn:
         return _err(rid, -32601, f"unknown method: {method}")
-    response = fn(rid, params)
-    if method == "prompt.submit" and params.get("submission_id") is not None:
-        session = _sessions.get(params.get("session_id") or "")
-        if session is not None:
-            finalize_prompt_submission_response(
-                session, str(params["submission_id"]), response
-            )
-    return response
+    return fn(rid, params)
 
 
 def _current_session_steer_authority(
@@ -2554,48 +2547,29 @@ def _sess_nowait(params, rid):
 def create_or_read_prompt_submission(
     session: dict, submission_id: str, semantic_fingerprint: str
 ) -> tuple[str, dict]:
-    """Reserve or replay session-local admission without durable semantics."""
+    """Atomically reserve an id-bearing submit before runtime mutation.
+
+    This is deliberately session-local admission state, not the durable
+    accepted-work schema. Spec-03 owns that schema and recovery lifecycle;
+    this bounded map only closes the live duplicate window until that durable
+    owner replaces it.
+    """
     with session["history_lock"]:
         admissions = session.setdefault("_prompt_submission_admissions", {})
         existing = admissions.get(submission_id)
         if existing is None:
+            ack = {"submission_id": submission_id, "status": "streaming"}
             admissions[submission_id] = {
                 "semantic_fingerprint": semantic_fingerprint,
-                "status": "pending",
-                "outcome": None,
+                "ack": ack,
             }
-            return "created", {}
-        if existing["semantic_fingerprint"] != semantic_fingerprint:
-            return "conflict", {
-                "submission_id": submission_id,
-                "field_classes": ["semantic_fingerprint"],
-            }
-        if existing["status"] == "pending":
-            return "pending", {"submission_id": submission_id, "status": "pending"}
-        return "existing", dict(existing["outcome"])
-
-
-def finalize_prompt_submission_response(
-    session: dict, submission_id: str, response: dict | None
-) -> None:
-    """Save this request's known local RPC outcome while holding no side-effect lock."""
-    if response is None:
-        return
-    outcome = {
-        key: value
-        for key, value in response.items()
-        if key in {"result", "error"}
-    }
-    pending_result = outcome.get("result")
-    if not outcome or (
-        isinstance(pending_result, dict) and pending_result.get("status") == "pending"
-    ):
-        return
-    with session["history_lock"]:
-        admission = session.get("_prompt_submission_admissions", {}).get(submission_id)
-        if admission is not None and admission["status"] == "pending":
-            admission["status"] = "final"
-            admission["outcome"] = outcome
+            return "created", dict(ack)
+        if existing["semantic_fingerprint"] == semantic_fingerprint:
+            return "existing", dict(existing["ack"])
+        return "conflict", {
+            "submission_id": submission_id,
+            "field_classes": ["semantic_fingerprint"],
+        }
 
 
 def _sess(params, rid):
