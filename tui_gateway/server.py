@@ -2544,34 +2544,6 @@ def _sess_nowait(params, rid):
     return (s, None) if s else (None, _err(rid, 4001, "session not found"))
 
 
-def create_or_read_prompt_submission(
-    session: dict, submission_id: str, semantic_fingerprint: str
-) -> tuple[str, dict]:
-    """Atomically reserve an id-bearing submit before runtime mutation.
-
-    This is deliberately session-local admission state, not the durable
-    accepted-work schema. Spec-03 owns that schema and recovery lifecycle;
-    this bounded map only closes the live duplicate window until that durable
-    owner replaces it.
-    """
-    with session["history_lock"]:
-        admissions = session.setdefault("_prompt_submission_admissions", {})
-        existing = admissions.get(submission_id)
-        if existing is None:
-            ack = {"submission_id": submission_id, "status": "streaming"}
-            admissions[submission_id] = {
-                "semantic_fingerprint": semantic_fingerprint,
-                "ack": ack,
-            }
-            return "created", dict(ack)
-        if existing["semantic_fingerprint"] == semantic_fingerprint:
-            return "existing", dict(existing["ack"])
-        return "conflict", {
-            "submission_id": submission_id,
-            "field_classes": ["semantic_fingerprint"],
-        }
-
-
 def _sess(params, rid):
     s, err = _sess_building(params, rid)
     if err:
