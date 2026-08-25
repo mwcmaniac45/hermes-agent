@@ -39,6 +39,13 @@ from agent.compaction_display import project_compaction_message_for_display
 from agent.skill_commands import describe_skill_invocation
 from agent.conversation_loop import INTERRUPT_WAITING_FOR_MODEL_PREFIX
 from tui_gateway import git_probe
+from tui_gateway.prompt_submission_contract import (
+    CONTRACT_VERSION,
+    DisplayKind,
+    build_canonical_semantic_object,
+    compute_semantic_fingerprint,
+    compute_text_sha256,
+)
 from tui_gateway.turn_marker import (
     clear_turn_marker,
     read_turn_marker,
@@ -2559,17 +2566,40 @@ def _admit_durable_prompt_submission(rid, params: dict, session: dict, text: str
         return None
     if not all(isinstance(params.get(name), str) and params[name] for name in durable_fields):
         return _err(rid, 4004, "invalid durable prompt submission")
+    claimed_fingerprint = params["semantic_fingerprint"]
+    if (
+        params["contract_version"] != CONTRACT_VERSION
+        or len(claimed_fingerprint) != 64
+        or any(char not in "0123456789abcdef" for char in claimed_fingerprint)
+        or not isinstance(text, str)
+    ):
+        return _err(rid, 4004, "invalid durable prompt submission")
     # Today's attachment and rewind paths need legacy in-memory/path state or
-    # a destructive locked DB rewrite.  Refuse before accepting rather than
-    # creating work legacy runtime cannot project safely.
+    # a destructive locked DB rewrite. Refuse every control before acceptance;
+    # v1 canonical semantics record those capabilities as explicitly unsupported.
     if session.get("attached_images") or params.get("attachments"):
         return _err(rid, 4092, "durable attachment replay requires reattach", data={"safe_action": "reattach_then_continue"})
-    if any(params.get(name) is not None for name in (
+    truncation_controls = (
         "truncate_before_user_ordinal", "truncate_before_row_id", "truncate_before_message_id",
-    )):
+        "confirm_truncate", "confirm_empty_truncate",
+    )
+    if any(name in params for name in truncation_controls):
         return _err(rid, 4092, "durable truncation is not available", data={"safe_action": "start_new_submission"})
     if display_kind == "hidden":
         return _err(rid, 4092, "durable hidden submission is not available", data={"safe_action": "start_new_submission"})
+    canonical_semantics = build_canonical_semantic_object(
+        text_sha256=compute_text_sha256(text),
+        display_kind=DisplayKind.NORMAL,
+        queued=bool(params.get("queued")),
+        interrupted=bool(params.get("interrupted")),
+        surface="hud" if params.get("surface") == "hud" else "",
+        truncation_target=None,
+        truncation_consent=False,
+        attachments=[],
+        replay_controls={"attachments": "unsupported", "truncation": "unsupported"},
+    )
+    if compute_semantic_fingerprint(canonical_semantics) != claimed_fingerprint:
+        return _err(rid, 4004, "invalid durable prompt submission")
     try:
         # The session FK is an ownership prerequisite, not prompt projection.
         # _ensure_session_db_row and _session_db share the profile-aware source.
@@ -2606,7 +2636,7 @@ def _admit_durable_prompt_submission(rid, params: dict, session: dict, text: str
     except Exception:
         # Commit is authoritative. Projection is best-effort and recoverable;
         # never alter or leak into the safe receipt/replay surface.
-        logger.debug("durable prompt projection scheduling failed", exc_info=True)
+        logger.debug("durable prompt projection scheduling failed")
     return _ok(rid, admitted["ack"])
 
 

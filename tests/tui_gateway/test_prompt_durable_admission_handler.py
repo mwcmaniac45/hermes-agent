@@ -4,10 +4,19 @@ These prove exactly-once durable acceptance/admission, not provider execution.
 """
 from __future__ import annotations
 
+import logging
 import threading
+
+import pytest
 
 from hermes_state import SessionDB
 from tui_gateway import server
+from tui_gateway.prompt_submission_contract import (
+    DisplayKind,
+    build_canonical_semantic_object,
+    compute_semantic_fingerprint,
+    compute_text_sha256,
+)
 
 
 def _session(profile_home, session_id="ui-session"):
@@ -21,19 +30,36 @@ def _session(profile_home, session_id="ui-session"):
     }
 
 
-def _request(submission_id="submission-1", fingerprint="a" * 64, **extra):
-    return {
-        "id": "request-1",
-        "method": "prompt.submit",
-        "params": {
-            "session_id": "ui-session",
-            "text": "private text",
-            "submission_id": submission_id,
-            "contract_version": "1",
-            "semantic_fingerprint": fingerprint,
-            **extra,
-        },
+def _fingerprint(*, text, queued=False, interrupted=False, surface=""):
+    """Use the public v1 canonicalizer, never a test-only hash algorithm."""
+    return compute_semantic_fingerprint(build_canonical_semantic_object(
+        text_sha256=compute_text_sha256(text),
+        display_kind=DisplayKind.NORMAL,
+        queued=queued,
+        interrupted=interrupted,
+        surface="hud" if surface == "hud" else "",
+        truncation_target=None,
+        truncation_consent=False,
+        attachments=[],
+        replay_controls={"attachments": "unsupported", "truncation": "unsupported"},
+    ))
+
+
+def _request(submission_id="submission-1", fingerprint=None, **extra):
+    params = {
+        "session_id": "ui-session",
+        "text": "private text",
+        "submission_id": submission_id,
+        "contract_version": "1",
+        **extra,
     }
+    params["semantic_fingerprint"] = fingerprint or _fingerprint(
+        text=params["text"],
+        queued=bool(params.get("queued")),
+        interrupted=bool(params.get("interrupted")),
+        surface=params.get("surface", ""),
+    )
+    return {"id": "request-1", "method": "prompt.submit", "params": params}
 
 
 def _prepare(profile_home):
@@ -51,8 +77,8 @@ def _count(profile_home):
         db.close()
 
 
-def test_handler_conflict_barrier_cannot_mutate_or_settle_original(monkeypatch, tmp_path):
-    """Same id/different fingerprint returns safe 4091 before every legacy mutation."""
+def test_handler_invalid_claimed_fingerprint_cannot_mutate_or_settle_original(monkeypatch, tmp_path):
+    """A noncanonical same-id retry is rejected before durable or legacy mutation."""
     profile_home = tmp_path / "profile"
     _prepare(profile_home)
     session = _session(profile_home)
@@ -68,14 +94,63 @@ def test_handler_conflict_barrier_cannot_mutate_or_settle_original(monkeypatch, 
         accepted = server.handle_request(_request())
         assert accepted["result"]["durable_admission_status"] == "accepted"
         original = _count(profile_home)
-        conflict = server.handle_request(_request(fingerprint="b" * 64))
-        assert conflict["error"]["code"] == 4091
-        assert conflict["error"]["data"] == {
-            "submission_id": "submission-1", "field_class": "semantic_fingerprint"
+        rejected = server.handle_request(_request(fingerprint="b" * 64))
+        assert rejected["error"] == {
+            "code": 4004, "message": "invalid durable prompt submission"
         }
         assert _count(profile_home) == original == (1, 1)
         assert mutations == []
         assert session["client_surface"] == "" and session["running"] is False
+    finally:
+        server._sessions.pop("ui-session", None)
+
+
+def test_handler_rejects_unverified_v1_before_any_storage_write(monkeypatch, tmp_path):
+    """Version, fingerprint grammar, and preimage mismatch fail closed pre-admission."""
+    profile_home = tmp_path / "profile"
+    _prepare(profile_home)
+    session = _session(profile_home)
+    server._sessions["ui-session"] = session
+    attempted_writes = []
+    monkeypatch.setattr(
+        server, "_ensure_session_db_row", lambda *a, **k: attempted_writes.append("ensure")
+    )
+    try:
+        for request in (
+            _request(submission_id="bad-version", contract_version="2"),
+            _request(submission_id="bad-grammar", fingerprint="A" * 64),
+            _request(submission_id="bad-preimage", fingerprint="a" * 64),
+        ):
+            response = server.handle_request(request)
+            assert response["error"] == {
+                "code": 4004, "message": "invalid durable prompt submission"
+            }
+        assert attempted_writes == []
+        assert _count(profile_home) == (0, 0)
+    finally:
+        server._sessions.pop("ui-session", None)
+
+
+def test_handler_same_id_changed_semantics_never_replays_prior_ack(monkeypatch, tmp_path):
+    """A claimed fingerprint cannot bind changed admitted text or flags to old work."""
+    profile_home = tmp_path / "profile"
+    _prepare(profile_home)
+    server._sessions["ui-session"] = _session(profile_home)
+    monkeypatch.setattr(server, "_schedule_durable_prompt_projection", lambda *a, **k: None)
+    try:
+        accepted = server.handle_request(_request())
+        assert accepted["result"]["durable_admission_status"] == "accepted"
+        claimed = _fingerprint(text="private text")
+        for changed in (
+            {"text": "unrelated second request"},
+            {"queued": True},
+            {"interrupted": True},
+        ):
+            rejected = server.handle_request(_request(fingerprint=claimed, **changed))
+            assert rejected["error"] == {
+                "code": 4004, "message": "invalid durable prompt submission"
+            }
+        assert _count(profile_home) == (1, 1)
     finally:
         server._sessions.pop("ui-session", None)
 
@@ -121,6 +196,62 @@ def test_handler_commit_checkpoint_is_recoverable_and_exact_retry_reads_it(monke
         server._sessions.pop("ui-session", None)
 
 
+@pytest.mark.parametrize(
+    ("control", "value"),
+    (
+        ("truncate_before_user_ordinal", 0),
+        ("truncate_before_row_id", "row-1"),
+        ("truncate_before_message_id", "message-1"),
+        ("confirm_truncate", True),
+        ("confirm_empty_truncate", True),
+    ),
+)
+def test_handler_rejects_every_v1_truncation_control_before_admission(
+    monkeypatch, tmp_path, control, value
+):
+    """Unsupported durable v1 rejects targets and orphan confirmations alike."""
+    profile_home = tmp_path / "profile"
+    _prepare(profile_home)
+    server._sessions["ui-session"] = _session(profile_home)
+    attempted_writes = []
+    monkeypatch.setattr(
+        server, "_ensure_session_db_row", lambda *a, **k: attempted_writes.append("ensure")
+    )
+    try:
+        response = server.handle_request(_request(submission_id=f"control-{control}", **{control: value}))
+        assert response["error"] == {
+            "code": 4092,
+            "message": "durable truncation is not available",
+            "data": {"safe_action": "start_new_submission"},
+        }
+        assert attempted_writes == []
+        assert _count(profile_home) == (0, 0)
+    finally:
+        server._sessions.pop("ui-session", None)
+
+
+def test_handler_changed_truncation_control_same_id_never_replays_prior_ack(monkeypatch, tmp_path):
+    """A retry cannot attach unsupported confirmation state to accepted work."""
+    profile_home = tmp_path / "profile"
+    _prepare(profile_home)
+    server._sessions["ui-session"] = _session(profile_home)
+    monkeypatch.setattr(server, "_schedule_durable_prompt_projection", lambda *a, **k: None)
+    try:
+        accepted = server.handle_request(_request())
+        replay = server.handle_request(_request(
+            fingerprint=_fingerprint(text="private text"), confirm_empty_truncate=True
+        ))
+        assert accepted["result"]["durable_admission_status"] == "accepted"
+        assert replay["error"] == {
+            "code": 4092,
+            "message": "durable truncation is not available",
+            "data": {"safe_action": "start_new_submission"},
+        }
+        assert _count(profile_home) == (1, 1)
+    finally:
+        server._sessions.pop("ui-session", None)
+
+
 def test_id_bearing_unsafe_attachment_or_truncation_fails_before_admission(monkeypatch, tmp_path):
     """Legacy-only path/rewind inputs fail closed without receipt or mutation."""
     profile_home = tmp_path / "profile"
@@ -142,13 +273,14 @@ def test_id_bearing_unsafe_attachment_or_truncation_fails_before_admission(monke
         server._sessions.pop("ui-session", None)
 
 
-def test_projection_failure_never_leaks_or_changes_safe_replay(monkeypatch, tmp_path):
-    """Post-commit projection errors are contained and cannot rewrite the receipt."""
+def test_projection_failure_never_leaks_or_changes_safe_replay(monkeypatch, tmp_path, caplog):
+    """Post-commit projection errors stay out of logs and cannot rewrite the receipt."""
     profile_home = tmp_path / "profile"
     _prepare(profile_home)
     server._sessions["ui-session"] = _session(profile_home)
-    raw = "projection traceback https://secret.example/?token=nope"
+    raw = "hostile prompt=/private token=not-a-secret path=/private/never-log"
     monkeypatch.setattr(server, "_schedule_durable_prompt_projection", lambda *a, **k: (_ for _ in ()).throw(RuntimeError(raw)))
+    caplog.set_level(logging.DEBUG, logger=server.__name__)
     try:
         accepted = server.handle_request(_request())
         replay = server.handle_request(_request())
@@ -156,5 +288,7 @@ def test_projection_failure_never_leaks_or_changes_safe_replay(monkeypatch, tmp_
         assert accepted["result"] == replay["result"]
         assert accepted["result"]["invocation_status"] == "accepted"
         assert _count(profile_home) == (1, 1)
+        assert raw not in caplog.text
+        assert all(record.exc_info is None for record in caplog.records)
     finally:
         server._sessions.pop("ui-session", None)
