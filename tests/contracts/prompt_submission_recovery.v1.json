@@ -1,0 +1,653 @@
+{
+  "contract_name": "prompt_submission_recovery",
+  "contract_version": "1",
+  "schema_version": "1.0.0",
+  "execution_guarantee": "durable_acceptance_admission_only",
+  "not_guaranteed": [
+    "provider_ran",
+    "user_turn_persisted",
+    "external_effect_occurred",
+    "exactly_once_provider_execution"
+  ],
+  "request_schema": {
+    "required_fields": [
+      "submission_id",
+      "contract_version",
+      "semantic_fingerprint"
+    ],
+    "field_notes": {
+      "submission_id": "Opaque UUID from crypto.randomUUID(); never a hash of prompt content.",
+      "semantic_fingerprint": "SHA-256 of sorted-key JSON canonical object; raw text excluded.",
+      "contract_version": "Must equal the fixture contract_version string."
+    }
+  },
+  "ack_schema": {
+    "required_fields": [
+      "submission_id",
+      "contract_version",
+      "semantic_fingerprint",
+      "durable_admission_status",
+      "invocation_status",
+      "safe_terminal_action"
+    ],
+    "durable_admission_status_values": ["accepted", "conflict"],
+    "invocation_status_values": [
+      "pending",
+      "queued",
+      "dispatching",
+      "invoking",
+      "running",
+      "completed",
+      "terminal_error",
+      "attachment_reattach_required",
+      "unknown_outcome"
+    ],
+    "safe_terminal_action_values": [
+      null,
+      "check_transcript_resume_or_start_new",
+      "reattach_then_continue",
+      "start_new_submission"
+    ]
+  },
+  "forbidden_in_logs_and_diagnostics": [
+    "text",
+    "prompt",
+    "canonical_text",
+    "path",
+    "previewUrl",
+    "detail",
+    "refText",
+    "bearer",
+    "token",
+    "error_body",
+    "raw_error",
+    "exception_message",
+    "fingerprint_preimage",
+    "attachment_capability",
+    "attachment_url"
+  ],
+  "safe_log_allowed_fields": [
+    "submission_id",
+    "contract_version",
+    "durable_admission_status",
+    "invocation_status",
+    "safe_terminal_action"
+  ],
+  "test_vectors": {
+    "required_field_validation": [
+      {
+        "id": "rfv_request_missing_submission_id",
+        "description": "Request missing submission_id must be rejected.",
+        "input": {
+          "contract_version": "1",
+          "semantic_fingerprint": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        },
+        "expect_error": true,
+        "missing_field": "submission_id"
+      },
+      {
+        "id": "rfv_request_missing_contract_version",
+        "description": "Request missing contract_version must be rejected.",
+        "input": {
+          "submission_id": "550e8400-e29b-41d4-a716-446655440000",
+          "semantic_fingerprint": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        },
+        "expect_error": true,
+        "missing_field": "contract_version"
+      },
+      {
+        "id": "rfv_request_missing_semantic_fingerprint",
+        "description": "Request missing semantic_fingerprint must be rejected.",
+        "input": {
+          "submission_id": "550e8400-e29b-41d4-a716-446655440000",
+          "contract_version": "1"
+        },
+        "expect_error": true,
+        "missing_field": "semantic_fingerprint"
+      },
+      {
+        "id": "rfv_ack_missing_durable_admission_status",
+        "description": "Ack missing durable_admission_status must be rejected.",
+        "input": {
+          "submission_id": "550e8400-e29b-41d4-a716-446655440000",
+          "contract_version": "1",
+          "semantic_fingerprint": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "invocation_status": "pending",
+          "safe_terminal_action": null
+        },
+        "expect_error": true,
+        "missing_field": "durable_admission_status"
+      },
+      {
+        "id": "rfv_ack_missing_invocation_status",
+        "description": "Ack missing invocation_status must be rejected.",
+        "input": {
+          "submission_id": "550e8400-e29b-41d4-a716-446655440000",
+          "contract_version": "1",
+          "semantic_fingerprint": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "durable_admission_status": "accepted",
+          "safe_terminal_action": null
+        },
+        "expect_error": true,
+        "missing_field": "invocation_status"
+      },
+      {
+        "id": "rfv_ack_missing_safe_terminal_action",
+        "description": "Ack missing safe_terminal_action must be rejected.",
+        "input": {
+          "submission_id": "550e8400-e29b-41d4-a716-446655440000",
+          "contract_version": "1",
+          "semantic_fingerprint": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "durable_admission_status": "accepted",
+          "invocation_status": "pending"
+        },
+        "expect_error": true,
+        "missing_field": "safe_terminal_action"
+      }
+    ],
+    "canonical_equivalence": [
+      {
+        "id": "ceq_field_insertion_order_irrelevant",
+        "description": "Two canonical objects with the same fields in different insertion order must produce the same fingerprint.",
+        "canonical_a": {
+          "text_sha256": "b94d27b9934d3e08a52e52d7da7dabfac484efe04294e576af58cb95b6887f",
+          "display_kind": "normal",
+          "display_metadata": null,
+          "queued": false,
+          "interrupted": false,
+          "surface": "main",
+          "truncation_target": null,
+          "truncation_consent": false,
+          "attachments": [],
+          "replay_controls": null
+        },
+        "canonical_b": {
+          "attachments": [],
+          "display_kind": "normal",
+          "display_metadata": null,
+          "interrupted": false,
+          "queued": false,
+          "replay_controls": null,
+          "surface": "main",
+          "text_sha256": "b94d27b9934d3e08a52e52d7da7dabfac484efe04294e576af58cb95b6887f",
+          "truncation_consent": false,
+          "truncation_target": null
+        },
+        "expect_same_fingerprint": true
+      },
+      {
+        "id": "ceq_attachment_list_order_normalized",
+        "description": "Attachments with same (order, identity, version) tuples but different array positions must produce the same fingerprint after sort normalization.",
+        "canonical_a": {
+          "text_sha256": "b94d27b9934d3e08a52e52d7da7dabfac484efe04294e576af58cb95b6887f",
+          "display_kind": "normal",
+          "display_metadata": null,
+          "queued": false,
+          "interrupted": false,
+          "surface": "main",
+          "truncation_target": null,
+          "truncation_consent": false,
+          "attachments": [
+            {"order": 1, "identity": "img-a", "version": "1"},
+            {"order": 2, "identity": "img-b", "version": "1"}
+          ],
+          "replay_controls": null
+        },
+        "canonical_b": {
+          "text_sha256": "b94d27b9934d3e08a52e52d7da7dabfac484efe04294e576af58cb95b6887f",
+          "display_kind": "normal",
+          "display_metadata": null,
+          "queued": false,
+          "interrupted": false,
+          "surface": "main",
+          "truncation_target": null,
+          "truncation_consent": false,
+          "attachments": [
+            {"order": 2, "identity": "img-b", "version": "1"},
+            {"order": 1, "identity": "img-a", "version": "1"}
+          ],
+          "replay_controls": null
+        },
+        "expect_same_fingerprint": true,
+        "note": "Implementations must sort attachments by (order, identity, version) before fingerprinting."
+      }
+    ],
+    "canonical_mismatch": [
+      {
+        "id": "cmm_text_sha256_changed",
+        "description": "Different text_sha256 must produce different fingerprint.",
+        "field_changed": "text_sha256",
+        "base": {
+          "text_sha256": "aaaa0000000000000000000000000000000000000000000000000000000000aa",
+          "display_kind": "normal",
+          "display_metadata": null,
+          "queued": false,
+          "interrupted": false,
+          "surface": "main",
+          "truncation_target": null,
+          "truncation_consent": false,
+          "attachments": [],
+          "replay_controls": null
+        },
+        "variant": {
+          "text_sha256": "bbbb0000000000000000000000000000000000000000000000000000000000bb",
+          "display_kind": "normal",
+          "display_metadata": null,
+          "queued": false,
+          "interrupted": false,
+          "surface": "main",
+          "truncation_target": null,
+          "truncation_consent": false,
+          "attachments": [],
+          "replay_controls": null
+        },
+        "expect_same_fingerprint": false
+      },
+      {
+        "id": "cmm_display_kind_changed",
+        "description": "Different display_kind must produce different fingerprint.",
+        "field_changed": "display_kind",
+        "base": {
+          "text_sha256": "aaaa0000000000000000000000000000000000000000000000000000000000aa",
+          "display_kind": "normal",
+          "display_metadata": null,
+          "queued": false,
+          "interrupted": false,
+          "surface": "main",
+          "truncation_target": null,
+          "truncation_consent": false,
+          "attachments": [],
+          "replay_controls": null
+        },
+        "variant": {
+          "text_sha256": "aaaa0000000000000000000000000000000000000000000000000000000000aa",
+          "display_kind": "voice",
+          "display_metadata": null,
+          "queued": false,
+          "interrupted": false,
+          "surface": "main",
+          "truncation_target": null,
+          "truncation_consent": false,
+          "attachments": [],
+          "replay_controls": null
+        },
+        "expect_same_fingerprint": false
+      },
+      {
+        "id": "cmm_display_metadata_changed",
+        "description": "Different display_metadata must produce different fingerprint.",
+        "field_changed": "display_metadata",
+        "base": {
+          "text_sha256": "aaaa0000000000000000000000000000000000000000000000000000000000aa",
+          "display_kind": "normal",
+          "display_metadata": null,
+          "queued": false,
+          "interrupted": false,
+          "surface": "main",
+          "truncation_target": null,
+          "truncation_consent": false,
+          "attachments": [],
+          "replay_controls": null
+        },
+        "variant": {
+          "text_sha256": "aaaa0000000000000000000000000000000000000000000000000000000000aa",
+          "display_kind": "normal",
+          "display_metadata": {"label": "changed"},
+          "queued": false,
+          "interrupted": false,
+          "surface": "main",
+          "truncation_target": null,
+          "truncation_consent": false,
+          "attachments": [],
+          "replay_controls": null
+        },
+        "expect_same_fingerprint": false
+      },
+      {
+        "id": "cmm_queued_changed",
+        "description": "Different queued flag must produce different fingerprint.",
+        "field_changed": "queued",
+        "base": {
+          "text_sha256": "aaaa0000000000000000000000000000000000000000000000000000000000aa",
+          "display_kind": "normal",
+          "display_metadata": null,
+          "queued": false,
+          "interrupted": false,
+          "surface": "main",
+          "truncation_target": null,
+          "truncation_consent": false,
+          "attachments": [],
+          "replay_controls": null
+        },
+        "variant": {
+          "text_sha256": "aaaa0000000000000000000000000000000000000000000000000000000000aa",
+          "display_kind": "normal",
+          "display_metadata": null,
+          "queued": true,
+          "interrupted": false,
+          "surface": "main",
+          "truncation_target": null,
+          "truncation_consent": false,
+          "attachments": [],
+          "replay_controls": null
+        },
+        "expect_same_fingerprint": false
+      },
+      {
+        "id": "cmm_interrupted_changed",
+        "description": "Different interrupted flag must produce different fingerprint.",
+        "field_changed": "interrupted",
+        "base": {
+          "text_sha256": "aaaa0000000000000000000000000000000000000000000000000000000000aa",
+          "display_kind": "normal",
+          "display_metadata": null,
+          "queued": false,
+          "interrupted": false,
+          "surface": "main",
+          "truncation_target": null,
+          "truncation_consent": false,
+          "attachments": [],
+          "replay_controls": null
+        },
+        "variant": {
+          "text_sha256": "aaaa0000000000000000000000000000000000000000000000000000000000aa",
+          "display_kind": "normal",
+          "display_metadata": null,
+          "queued": false,
+          "interrupted": true,
+          "surface": "main",
+          "truncation_target": null,
+          "truncation_consent": false,
+          "attachments": [],
+          "replay_controls": null
+        },
+        "expect_same_fingerprint": false
+      },
+      {
+        "id": "cmm_surface_changed",
+        "description": "Different surface must produce different fingerprint.",
+        "field_changed": "surface",
+        "base": {
+          "text_sha256": "aaaa0000000000000000000000000000000000000000000000000000000000aa",
+          "display_kind": "normal",
+          "display_metadata": null,
+          "queued": false,
+          "interrupted": false,
+          "surface": "main",
+          "truncation_target": null,
+          "truncation_consent": false,
+          "attachments": [],
+          "replay_controls": null
+        },
+        "variant": {
+          "text_sha256": "aaaa0000000000000000000000000000000000000000000000000000000000aa",
+          "display_kind": "normal",
+          "display_metadata": null,
+          "queued": false,
+          "interrupted": false,
+          "surface": "sidebar",
+          "truncation_target": null,
+          "truncation_consent": false,
+          "attachments": [],
+          "replay_controls": null
+        },
+        "expect_same_fingerprint": false
+      },
+      {
+        "id": "cmm_truncation_target_changed",
+        "description": "Different truncation_target must produce different fingerprint.",
+        "field_changed": "truncation_target",
+        "base": {
+          "text_sha256": "aaaa0000000000000000000000000000000000000000000000000000000000aa",
+          "display_kind": "normal",
+          "display_metadata": null,
+          "queued": false,
+          "interrupted": false,
+          "surface": "main",
+          "truncation_target": null,
+          "truncation_consent": false,
+          "attachments": [],
+          "replay_controls": null
+        },
+        "variant": {
+          "text_sha256": "aaaa0000000000000000000000000000000000000000000000000000000000aa",
+          "display_kind": "normal",
+          "display_metadata": null,
+          "queued": false,
+          "interrupted": false,
+          "surface": "main",
+          "truncation_target": "turn-42",
+          "truncation_consent": false,
+          "attachments": [],
+          "replay_controls": null
+        },
+        "expect_same_fingerprint": false
+      },
+      {
+        "id": "cmm_truncation_consent_changed",
+        "description": "Different truncation_consent must produce different fingerprint.",
+        "field_changed": "truncation_consent",
+        "base": {
+          "text_sha256": "aaaa0000000000000000000000000000000000000000000000000000000000aa",
+          "display_kind": "normal",
+          "display_metadata": null,
+          "queued": false,
+          "interrupted": false,
+          "surface": "main",
+          "truncation_target": null,
+          "truncation_consent": false,
+          "attachments": [],
+          "replay_controls": null
+        },
+        "variant": {
+          "text_sha256": "aaaa0000000000000000000000000000000000000000000000000000000000aa",
+          "display_kind": "normal",
+          "display_metadata": null,
+          "queued": false,
+          "interrupted": false,
+          "surface": "main",
+          "truncation_target": null,
+          "truncation_consent": true,
+          "attachments": [],
+          "replay_controls": null
+        },
+        "expect_same_fingerprint": false
+      },
+      {
+        "id": "cmm_attachment_identity_changed",
+        "description": "Different attachment identity must produce different fingerprint.",
+        "field_changed": "attachment_identity",
+        "base": {
+          "text_sha256": "aaaa0000000000000000000000000000000000000000000000000000000000aa",
+          "display_kind": "normal",
+          "display_metadata": null,
+          "queued": false,
+          "interrupted": false,
+          "surface": "main",
+          "truncation_target": null,
+          "truncation_consent": false,
+          "attachments": [{"order": 1, "identity": "img-original", "version": "1"}],
+          "replay_controls": null
+        },
+        "variant": {
+          "text_sha256": "aaaa0000000000000000000000000000000000000000000000000000000000aa",
+          "display_kind": "normal",
+          "display_metadata": null,
+          "queued": false,
+          "interrupted": false,
+          "surface": "main",
+          "truncation_target": null,
+          "truncation_consent": false,
+          "attachments": [{"order": 1, "identity": "img-different", "version": "1"}],
+          "replay_controls": null
+        },
+        "expect_same_fingerprint": false
+      },
+      {
+        "id": "cmm_attachment_version_changed",
+        "description": "Different attachment version must produce different fingerprint.",
+        "field_changed": "attachment_version",
+        "base": {
+          "text_sha256": "aaaa0000000000000000000000000000000000000000000000000000000000aa",
+          "display_kind": "normal",
+          "display_metadata": null,
+          "queued": false,
+          "interrupted": false,
+          "surface": "main",
+          "truncation_target": null,
+          "truncation_consent": false,
+          "attachments": [{"order": 1, "identity": "img-a", "version": "1"}],
+          "replay_controls": null
+        },
+        "variant": {
+          "text_sha256": "aaaa0000000000000000000000000000000000000000000000000000000000aa",
+          "display_kind": "normal",
+          "display_metadata": null,
+          "queued": false,
+          "interrupted": false,
+          "surface": "main",
+          "truncation_target": null,
+          "truncation_consent": false,
+          "attachments": [{"order": 1, "identity": "img-a", "version": "2"}],
+          "replay_controls": null
+        },
+        "expect_same_fingerprint": false
+      },
+      {
+        "id": "cmm_attachment_order_changed",
+        "description": "Attachments with same identity/version but swapped order values produce different fingerprint.",
+        "field_changed": "attachment_order",
+        "base": {
+          "text_sha256": "aaaa0000000000000000000000000000000000000000000000000000000000aa",
+          "display_kind": "normal",
+          "display_metadata": null,
+          "queued": false,
+          "interrupted": false,
+          "surface": "main",
+          "truncation_target": null,
+          "truncation_consent": false,
+          "attachments": [
+            {"order": 1, "identity": "img-a", "version": "1"},
+            {"order": 2, "identity": "img-b", "version": "1"}
+          ],
+          "replay_controls": null
+        },
+        "variant": {
+          "text_sha256": "aaaa0000000000000000000000000000000000000000000000000000000000aa",
+          "display_kind": "normal",
+          "display_metadata": null,
+          "queued": false,
+          "interrupted": false,
+          "surface": "main",
+          "truncation_target": null,
+          "truncation_consent": false,
+          "attachments": [
+            {"order": 2, "identity": "img-a", "version": "1"},
+            {"order": 1, "identity": "img-b", "version": "1"}
+          ],
+          "replay_controls": null
+        },
+        "expect_same_fingerprint": false
+      },
+      {
+        "id": "cmm_replay_controls_changed",
+        "description": "Different replay_controls must produce different fingerprint.",
+        "field_changed": "replay_controls",
+        "base": {
+          "text_sha256": "aaaa0000000000000000000000000000000000000000000000000000000000aa",
+          "display_kind": "normal",
+          "display_metadata": null,
+          "queued": false,
+          "interrupted": false,
+          "surface": "main",
+          "truncation_target": null,
+          "truncation_consent": false,
+          "attachments": [],
+          "replay_controls": null
+        },
+        "variant": {
+          "text_sha256": "aaaa0000000000000000000000000000000000000000000000000000000000aa",
+          "display_kind": "normal",
+          "display_metadata": null,
+          "queued": false,
+          "interrupted": false,
+          "surface": "main",
+          "truncation_target": null,
+          "truncation_consent": false,
+          "attachments": [],
+          "replay_controls": {"allow_retry_after_unknown_outcome": false}
+        },
+        "expect_same_fingerprint": false
+      }
+    ],
+    "valid_ack_vectors": [
+      {
+        "id": "vav_accepted_normal_pending",
+        "description": "Newly accepted normal submission — provider not yet invoked.",
+        "ack": {
+          "submission_id": "550e8400-e29b-41d4-a716-446655440001",
+          "contract_version": "1",
+          "semantic_fingerprint": "aaaa0000000000000000000000000000000000000000000000000000000000aa",
+          "durable_admission_status": "accepted",
+          "invocation_status": "pending",
+          "safe_terminal_action": null
+        },
+        "expect_valid": true
+      },
+      {
+        "id": "vav_accepted_queued",
+        "description": "Accepted and queued behind a busy turn.",
+        "ack": {
+          "submission_id": "550e8400-e29b-41d4-a716-446655440002",
+          "contract_version": "1",
+          "semantic_fingerprint": "bbbb0000000000000000000000000000000000000000000000000000000000bb",
+          "durable_admission_status": "accepted",
+          "invocation_status": "queued",
+          "safe_terminal_action": null
+        },
+        "expect_valid": true
+      },
+      {
+        "id": "vav_unknown_outcome_with_action",
+        "description": "Invocation-bearing row recovered as unknown outcome — truthful action required.",
+        "ack": {
+          "submission_id": "550e8400-e29b-41d4-a716-446655440003",
+          "contract_version": "1",
+          "semantic_fingerprint": "cccc0000000000000000000000000000000000000000000000000000000000cc",
+          "durable_admission_status": "accepted",
+          "invocation_status": "unknown_outcome",
+          "safe_terminal_action": "check_transcript_resume_or_start_new"
+        },
+        "expect_valid": true
+      },
+      {
+        "id": "vav_attachment_reattach_required",
+        "description": "Accepted work whose attachments are unavailable for replay — reattach required.",
+        "ack": {
+          "submission_id": "550e8400-e29b-41d4-a716-446655440004",
+          "contract_version": "1",
+          "semantic_fingerprint": "dddd0000000000000000000000000000000000000000000000000000000000dd",
+          "durable_admission_status": "accepted",
+          "invocation_status": "attachment_reattach_required",
+          "safe_terminal_action": "reattach_then_continue"
+        },
+        "expect_valid": true
+      },
+      {
+        "id": "vav_conflict_with_safe_data_only",
+        "description": "Duplicate id with changed canonical field — conflict ack contains only safe id/field-class data.",
+        "ack": {
+          "submission_id": "550e8400-e29b-41d4-a716-446655440005",
+          "contract_version": "1",
+          "semantic_fingerprint": "eeee0000000000000000000000000000000000000000000000000000000000ee",
+          "durable_admission_status": "conflict",
+          "invocation_status": "pending",
+          "safe_terminal_action": null,
+          "conflict_field_class": "text"
+        },
+        "expect_valid": true,
+        "note": "conflict_field_class is an optional informational field; only safe field-class labels allowed — never raw field values."
+      }
+    ]
+  }
+}
