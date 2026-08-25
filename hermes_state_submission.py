@@ -120,6 +120,23 @@ class SessionSubmissionMixin:
                 "durable_admission_status": "accepted", "invocation_status": state.lower(),
                 "safe_terminal_action": _SAFE_ACTION.get(state)}
 
+    def read_prompt_submission_receipt(self, *, session_id: str, submission_id: str,
+                                       semantic_fingerprint: str) -> dict[str, Any] | None:
+        """Read an existing receipt without creating work or mutating runtime state."""
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT r.semantic_fingerprint, r.work_id, w.state "
+                "FROM prompt_submission_receipts r JOIN prompt_accepted_work w ON w.work_id=r.work_id "
+                "WHERE r.session_id=? AND r.submission_id=?",
+                (session_id, submission_id),
+            ).fetchone()
+        if row is None:
+            return None
+        if row["semantic_fingerprint"] != semantic_fingerprint:
+            return {"conflict": True}
+        return {"conflict": False, "work_id": row["work_id"],
+                "ack": self._submission_ack(submission_id, row["state"])}
+
     def create_or_read_prompt_submission(self, *, session_id: str, submission_id: str,
                                          contract_version: str, semantic_fingerprint: str,
                                          payload: dict[str, Any], before_commit=None) -> dict[str, Any]:
@@ -174,6 +191,15 @@ class SessionSubmissionMixin:
                 "owner_generation": row["owner_generation"],
             }
         return self._execute_write(write)
+
+    def release_prompt_submission_dispatch(self, work_id: str, *, owner_token: str) -> bool:
+        """Release only this owner's uninvoked DISPATCHING claim back to ACCEPTED."""
+        return self._execute_write(lambda conn: conn.execute(
+            "UPDATE prompt_accepted_work SET state='ACCEPTED', owner_token=NULL, "
+            "lease_expires_at=NULL, updated_at=? WHERE work_id=? AND owner_token=? "
+            "AND state='DISPATCHING' AND invocation_attempt_token IS NULL",
+            (time.time(), work_id, owner_token),
+        ).rowcount == 1)
 
     def mark_prompt_submission_invoking(self, work_id: str, *, owner_token: str, attempt_token: str, lease_seconds: float = 30) -> dict[str, Any] | None:
         now = time.time()

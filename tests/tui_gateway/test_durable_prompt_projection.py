@@ -123,6 +123,213 @@ def test_owner_attempt_fencing_rejects_stale_renewal_and_settlement(tmp_path):
         db.close()
 
 
+def test_dispatching_owner_can_release_only_its_uninvoked_claim(tmp_path):
+    db = _db(tmp_path, "session-a")
+    try:
+        work = _work(db)
+        db.claim_prompt_submission_work(work["work_id"], owner_token="owner-a", session_id="session-a")
+        assert db.release_prompt_submission_dispatch(
+            work["work_id"], owner_token="owner-b"
+        ) is False
+        assert db.release_prompt_submission_dispatch(
+            work["work_id"], owner_token="owner-a"
+        ) is True
+        replay = db.create_or_read_prompt_submission(
+            session_id="session-a", submission_id="submission-a", contract_version="1",
+            semantic_fingerprint="a" * 64, payload={"text": "private text"},
+        )
+        assert replay["ack"]["invocation_status"] == "accepted"
+    finally:
+        db.close()
+
+
+def test_scheduler_build_failure_releases_claim_and_preserves_other_inflight(monkeypatch, tmp_path):
+    profile = tmp_path / "profile"
+    profile.mkdir()
+    db = SessionDB(db_path=profile / "state.db")
+    db.create_session("session-a", "tui")
+    work = _work(db)
+    db.close()
+    session = _session(profile)
+    session["inflight_turn"] = {"submission_id": "another-turn", "status": "running"}
+
+    class InlineThread:
+        def __init__(self, *, target, daemon):
+            self.target = target
+        def start(self):
+            self.target()
+
+    provider_entries = []
+    monkeypatch.setattr(server.threading, "Thread", InlineThread)
+    monkeypatch.setattr(server, "_start_agent_build", lambda *_a: None)
+    monkeypatch.setattr(server, "_wait_agent_for_prompt", lambda *_a: {"error": "build failed"})
+    monkeypatch.setattr(server, "_run_prompt_submit", lambda *_a, **_k: provider_entries.append(True))
+
+    server._schedule_durable_prompt_projection(session, work["work_id"])
+
+    check = SessionDB(db_path=profile / "state.db")
+    try:
+        replay = check.create_or_read_prompt_submission(
+            session_id="session-a", submission_id="submission-a", contract_version="1",
+            semantic_fingerprint="a" * 64, payload={"text": "private text"},
+        )
+        assert replay["ack"]["invocation_status"] == "accepted"
+    finally:
+        check.close()
+    assert session["running"] is False
+    assert session["inflight_turn"]["submission_id"] == "another-turn"
+    assert provider_entries == []
+
+
+def test_scheduler_projects_real_accepted_work_to_completed_before_exact_replay(monkeypatch, tmp_path):
+    profile = tmp_path / "profile"
+    profile.mkdir()
+    db = SessionDB(db_path=profile / "state.db")
+    db.create_session("session-a", "tui")
+    work = _work(db)
+    db.close()
+    session = _session(profile)
+    switches, provider_entries, emitted = [], [], []
+
+    class InlineThread:
+        def __init__(self, *, target, daemon):
+            self.target = target
+        def start(self):
+            self.target()
+
+    class JoinedThread:
+        def join(self):
+            return None
+
+    class Agent:
+        session_id = "session-a"
+        provider = "test"
+        model = "before"
+        interim_assistant_callback = None
+        def run_conversation(self, message, **_kwargs):
+            assert switches == ["applied"]
+            provider_entries.append(message)
+            return {"messages": [{"role": "user", "content": message}, {"role": "assistant", "content": "ok"}], "final_response": "ok"}
+
+    session["agent"] = Agent()
+    monkeypatch.setattr(server.threading, "Thread", InlineThread)
+    monkeypatch.setattr(server, "_start_agent_build", lambda *_a: None)
+    monkeypatch.setattr(server, "_wait_agent_for_prompt", lambda *_a: None)
+    monkeypatch.setattr(server, "_apply_pending_model_switch", lambda *_a: switches.append("applied"))
+    monkeypatch.setattr(server, "_sync_agent_model_with_config", lambda *_a: None)
+    monkeypatch.setattr(server, "_sync_bot_capabilities", lambda *_a: None)
+    monkeypatch.setattr(server, "_start_usage_ticker", lambda *_a: (threading.Event(), JoinedThread()))
+    monkeypatch.setattr(server, "_get_usage", lambda *_a: {})
+    monkeypatch.setattr(server, "_emit", lambda *a: emitted.append(a))
+
+    server._schedule_durable_prompt_projection(session, work["work_id"])
+
+    check = SessionDB(db_path=profile / "state.db")
+    try:
+        replay = check.create_or_read_prompt_submission(
+            session_id="session-a", submission_id="submission-a", contract_version="1",
+            semantic_fingerprint="a" * 64, payload={"text": "private text"},
+        )
+        assert replay["ack"]["invocation_status"] == "completed"
+    finally:
+        check.close()
+    assert provider_entries == ["private text"]
+    assert not any(event[0] == "message.delta" for event in emitted)
+    assert session["running"] is False
+
+
+def test_scheduler_invalid_payload_releases_without_agent_or_provider(monkeypatch, tmp_path):
+    profile = tmp_path / "profile"
+    profile.mkdir()
+    db = SessionDB(db_path=profile / "state.db")
+    db.create_session("session-a", "tui")
+    work = db.create_or_read_prompt_submission(
+        session_id="session-a", submission_id="invalid", contract_version="1",
+        semantic_fingerprint="b" * 64,
+        payload={"text": "private text", "queued": True},
+    )
+    db.close()
+    session = _session(profile)
+
+    class InlineThread:
+        def __init__(self, *, target, daemon): self.target = target
+        def start(self): self.target()
+
+    calls = []
+    monkeypatch.setattr(server.threading, "Thread", InlineThread)
+    monkeypatch.setattr(server, "_start_agent_build", lambda *_a: calls.append("build"))
+    monkeypatch.setattr(server, "_run_prompt_submit", lambda *_a, **_k: calls.append("provider"))
+    server._schedule_durable_prompt_projection(session, work["work_id"])
+
+    check = SessionDB(db_path=profile / "state.db")
+    try:
+        assert check.create_or_read_prompt_submission(
+            session_id="session-a", submission_id="invalid", contract_version="1",
+            semantic_fingerprint="b" * 64, payload={"text": "private text", "queued": True},
+        )["ack"]["invocation_status"] == "accepted"
+    finally:
+        check.close()
+    assert calls == [] and session["running"] is False
+
+
+@pytest.mark.parametrize("outcome", ("returned_error", "raised_error"))
+def test_durable_provider_failures_never_surface_hostile_data(monkeypatch, tmp_path, outcome, capsys):
+    profile = tmp_path / "profile"
+    profile.mkdir()
+    db = SessionDB(db_path=profile / "state.db")
+    db.create_session("session-a", "tui")
+    work = _work(db)
+    db.close()
+    session = _session(profile)
+    hostile = "token=secret /private/path prompt=never-render"
+    emitted = []
+
+    class InlineThread:
+        def __init__(self, *, target, daemon): self.target = target
+        def start(self): self.target()
+
+    class JoinedThread:
+        def join(self): return None
+
+    class Agent:
+        session_id = "session-a"
+        provider = "test"
+        model = "test"
+        interim_assistant_callback = None
+        def run_conversation(self, *_a, **_k):
+            if outcome == "raised_error":
+                raise RuntimeError(hostile)
+            return {"error": hostile, "failed": True}
+
+    session["agent"] = Agent()
+    monkeypatch.setattr(server.threading, "Thread", InlineThread)
+    monkeypatch.setattr(server, "_start_agent_build", lambda *_a: None)
+    monkeypatch.setattr(server, "_wait_agent_for_prompt", lambda *_a: None)
+    monkeypatch.setattr(server, "_apply_pending_model_switch", lambda *_a: None)
+    monkeypatch.setattr(server, "_sync_agent_model_with_config", lambda *_a: None)
+    monkeypatch.setattr(server, "_sync_bot_capabilities", lambda *_a: None)
+    monkeypatch.setattr(server, "_start_usage_ticker", lambda *_a: (threading.Event(), JoinedThread()))
+    monkeypatch.setattr(server, "_get_usage", lambda *_a: {})
+    monkeypatch.setattr(server, "_emit", lambda *a: emitted.append(a))
+    monkeypatch.setattr(server, "_CRASH_LOG", str(tmp_path / "crash.log"))
+
+    server._schedule_durable_prompt_projection(session, work["work_id"])
+
+    check = SessionDB(db_path=profile / "state.db")
+    try:
+        replay = check.create_or_read_prompt_submission(
+            session_id="session-a", submission_id="submission-a", contract_version="1",
+            semantic_fingerprint="a" * 64, payload={"text": "private text"},
+        )
+        assert replay["ack"]["invocation_status"] in {"terminal_error", "unknown_outcome"}
+    finally:
+        check.close()
+    assert hostile not in repr(emitted)
+    assert hostile not in capsys.readouterr().err
+    assert not (tmp_path / "crash.log").exists()
+    assert not session.get("inflight_turn")
+
+
 @pytest.mark.parametrize("control", ("running", "queued", "interrupted", "attachments", "hidden", "truncation"))
 def test_v1_unsupported_or_busy_admission_has_no_receipt_or_runtime_mutation(monkeypatch, tmp_path, control):
     profile = tmp_path / "profile"

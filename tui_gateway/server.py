@@ -2546,6 +2546,54 @@ def _start_agent_build(sid: str, session: dict) -> None:
     build_thread.start()
 
 
+def _cleanup_durable_preinvocation_projection(session: dict, work_id: str, owner_token: str) -> None:
+    """Release an uninvoked durable claim and only this projection's live flag."""
+    try:
+        with _session_db(session) as db:
+            if db is not None:
+                db.release_prompt_submission_dispatch(work_id, owner_token=owner_token)
+    except Exception:
+        pass
+    with session["history_lock"]:
+        if session.get("_durable_projection_work_id") == work_id:
+            session.pop("_durable_projection_work_id", None)
+            session["running"] = False
+            inflight = session.get("inflight_turn")
+            if isinstance(inflight, dict) and inflight.get("durable_work_id") == work_id:
+                session.pop("inflight_turn", None)
+
+
+def _settle_durable_terminal(session: dict, durable_context: dict[str, Any], *, state: str) -> bool:
+    safe_terminal = None if state == "COMPLETED" else {
+        "layer": "provider" if state == "TERMINAL_ERROR" else "recovery",
+        "code": "provider_failed" if state == "TERMINAL_ERROR" else "unknown_outcome",
+        "retryable": False,
+        "safe_action": "start_new_submission" if state == "TERMINAL_ERROR" else "check_transcript_resume_or_start_new",
+    }
+    try:
+        with _session_db(session) as db:
+            return db is not None and db.complete_prompt_submission_work(
+                durable_context["work_id"], owner_token=durable_context["owner_token"],
+                attempt_token=durable_context["attempt_token"], state=state,
+                safe_terminal=safe_terminal,
+            )
+    except Exception:
+        return False
+
+
+def _emit_durable_safe_failure(sid: str, session: dict, durable_context: dict[str, Any], marker_key: str, *, state: str) -> None:
+    """Settle and render durable failures without retaining provider-originated data."""
+    _settle_durable_terminal(session, durable_context, state=state)
+    with session["history_lock"]:
+        if session.get("_durable_projection_work_id") == durable_context["work_id"]:
+            _clear_inflight_turn(session)
+    _retire_turn_marker(session, marker_key)
+    _emit("message.complete", sid, {
+        "text": "", "status": "error", "error": "Durable submission failed.",
+        "recoverable": False,
+    })
+
+
 def _schedule_durable_prompt_projection(session: dict, work_id: str) -> None:
     """Claim and project one text-only v1 row without re-entering prompt.submit."""
     sid = str(session.get("session_key") or "")
@@ -2571,14 +2619,18 @@ def _schedule_durable_prompt_projection(session: dict, work_id: str) -> None:
                 or payload.get("truncation_consent")
                 or not isinstance(payload.get("text"), str)
             ):
+                _cleanup_durable_preinvocation_projection(session, work_id, owner_token)
                 return
             with session["history_lock"]:
                 if session.get("running") or session.get("_closing") or session.get("session_key") != sid:
+                    _cleanup_durable_preinvocation_projection(session, work_id, owner_token)
                     return
                 session["running"] = True
+                session["_durable_projection_work_id"] = work_id
                 session["last_active"] = time.time()
             _start_agent_build(sid, session)
             if _wait_agent_for_prompt(session, f"__durable__{work_id}", sid) is not None:
+                _cleanup_durable_preinvocation_projection(session, work_id, owner_token)
                 return
             _run_prompt_submit(
                 f"__durable__{work_id}", sid, session, payload["text"],
@@ -2589,7 +2641,7 @@ def _schedule_durable_prompt_projection(session: dict, work_id: str) -> None:
                 },
             )
         except Exception:
-            # The durable row remains recoverable; never surface untrusted details.
+            _cleanup_durable_preinvocation_projection(session, work_id, owner_token)
             return
 
     threading.Thread(target=dispatch, daemon=True).start()
@@ -2627,25 +2679,41 @@ def _admit_durable_prompt_submission(rid, params: dict, session: dict, text: str
     )
     if compute_semantic_fingerprint(canonical_semantics) != claimed_fingerprint:
         return _err(rid, 4004, "invalid durable prompt submission")
-    # v1 is deliberately text-only, normal, and idle-only. These guards run
-    # before create-or-read so unsupported semantics cannot mint a receipt.
-    with session["history_lock"]:
-        busy = bool(session.get("running"))
-    if busy or params.get("queued") is True or params.get("interrupted") is True:
-        return _err(rid, 4092, "durable busy submission is not available", data={"safe_action": "start_new_submission"})
-    # Today's attachment and rewind paths need legacy in-memory/path state or
-    # a destructive locked DB rewrite. Refuse every control before acceptance;
-    # v1 canonical semantics record those capabilities as explicitly unsupported.
-    if session.get("attached_images") or params.get("attachments"):
-        return _err(rid, 4092, "durable attachment replay requires reattach", data={"safe_action": "reattach_then_continue"})
     truncation_controls = (
         "truncate_before_user_ordinal", "truncate_before_row_id", "truncate_before_message_id",
         "confirm_truncate", "confirm_empty_truncate",
     )
-    if any(name in params for name in truncation_controls):
-        return _err(rid, 4092, "durable truncation is not available", data={"safe_action": "start_new_submission"})
-    if display_kind == "hidden":
-        return _err(rid, 4092, "durable hidden submission is not available", data={"safe_action": "start_new_submission"})
+    if params.get("attachments"):
+        return _err(rid, 4092, "durable attachment replay requires reattach", data={"safe_action": "reattach_then_continue"})
+    if any(name in params for name in truncation_controls) or display_kind == "hidden":
+        return _err(rid, 4092, "durable truncation is not available" if any(name in params for name in truncation_controls) else "durable hidden submission is not available", data={"safe_action": "start_new_submission"})
+    # Exact valid replays are a pure receipt read before runtime availability
+    # checks. A running/queued session may not admit new work, but it must still
+    # acknowledge the same already-admitted submission without mutation.
+    session_id = str(session.get("session_key") or params.get("session_id") or "")
+    try:
+        with _session_db(session) as db:
+            existing = None if db is None else db.read_prompt_submission_receipt(
+                session_id=session_id, submission_id=params["submission_id"],
+                semantic_fingerprint=params["semantic_fingerprint"],
+            )
+    except Exception:
+        return _err(rid, 5071, "session storage could not be opened")
+    if existing is not None:
+        if existing["conflict"]:
+            return _err(rid, 4091, "durable submission conflict", data={
+                "submission_id": params["submission_id"], "field_class": "semantic_fingerprint",
+            })
+        return _ok(rid, existing["ack"])
+    # v1 is deliberately text-only, normal, and idle-only. These guards run
+    # before creation so unsupported semantics cannot mint a receipt.
+    with session["history_lock"]:
+        busy = bool(session.get("running"))
+    if busy or params.get("queued") is True or params.get("interrupted") is True:
+        return _err(rid, 4092, "durable busy submission is not available", data={"safe_action": "start_new_submission"})
+    # A currently attached legacy capability still blocks only a new admission.
+    if session.get("attached_images"):
+        return _err(rid, 4092, "durable attachment replay requires reattach", data={"safe_action": "reattach_then_continue"})
     try:
         # The session FK is an ownership prerequisite, not prompt projection.
         # _ensure_session_db_row and _session_db share the profile-aware source.
@@ -11247,8 +11315,14 @@ def _run_prompt_submit(
                             attempt_token=attempt_token,
                         )
                 except Exception:
+                    _cleanup_durable_preinvocation_projection(
+                        session, durable_context["work_id"], durable_context["owner_token"]
+                    )
                     return
                 if invoking is None:
+                    _cleanup_durable_preinvocation_projection(
+                        session, durable_context["work_id"], durable_context["owner_token"]
+                    )
                     return
                 durable_context["attempt_token"] = attempt_token
                 try:
@@ -11258,8 +11332,10 @@ def _run_prompt_submit(
                             attempt_token=attempt_token,
                         )
                 except Exception:
+                    _settle_durable_terminal(session, durable_context, state="TERMINAL_ERROR")
                     return
                 if not running:
+                    _settle_durable_terminal(session, durable_context, state="TERMINAL_ERROR")
                     return
                 lease_stop = threading.Event()
 
@@ -11282,17 +11358,9 @@ def _run_prompt_submit(
                 result = agent.run_conversation(run_message, **run_kwargs)
             except Exception:
                 if durable_context is not None:
-                    try:
-                        with _session_db(session) as durable_db:
-                            if durable_db is not None:
-                                durable_db.complete_prompt_submission_work(
-                                    durable_context["work_id"], owner_token=durable_context["owner_token"],
-                                    attempt_token=durable_context["attempt_token"], state="UNKNOWN_OUTCOME",
-                                    safe_terminal={"layer": "recovery", "code": "unknown_outcome", "retryable": False,
-                                                   "safe_action": "check_transcript_resume_or_start_new"},
-                                )
-                    except Exception:
-                        pass
+                    _emit_durable_safe_failure(
+                        sid, session, durable_context, marker_key, state="UNKNOWN_OUTCOME"
+                    )
                 return
             finally:
                 if lease_stop is not None:
@@ -11312,20 +11380,12 @@ def _run_prompt_submit(
                 _usage_thread.join()
             if durable_context is not None:
                 terminal_state = "TERMINAL_ERROR" if isinstance(result, dict) and result.get("error") else "COMPLETED"
-                terminal = (
-                    {"layer": "provider", "code": "provider_failed", "retryable": False,
-                     "safe_action": "start_new_submission"}
-                    if terminal_state == "TERMINAL_ERROR" else None
-                )
-                try:
-                    with _session_db(session) as durable_db:
-                        if durable_db is None or not durable_db.complete_prompt_submission_work(
-                            durable_context["work_id"], owner_token=durable_context["owner_token"],
-                            attempt_token=durable_context["attempt_token"], state=terminal_state,
-                            safe_terminal=terminal,
-                        ):
-                            return
-                except Exception:
+                if not _settle_durable_terminal(session, durable_context, state=terminal_state):
+                    return
+                if terminal_state == "TERMINAL_ERROR":
+                    _emit_durable_safe_failure(
+                        sid, session, durable_context, marker_key, state="TERMINAL_ERROR"
+                    )
                     return
             if display_kind and isinstance(text, str):
                 db = getattr(agent, "_session_db", None)
@@ -11718,6 +11778,11 @@ def _run_prompt_submit(
                 except Exception as e:
                     logger.warning("voice TTS dispatch failed: %s", e)
         except Exception as e:
+            if durable_context is not None and durable_context.get("attempt_token"):
+                _emit_durable_safe_failure(
+                    sid, session, durable_context, marker_key, state="UNKNOWN_OUTCOME"
+                )
+                return
             import traceback
 
             trace = traceback.format_exc()

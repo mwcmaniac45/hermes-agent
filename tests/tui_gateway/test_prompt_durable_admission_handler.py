@@ -105,6 +105,24 @@ def test_handler_invalid_claimed_fingerprint_cannot_mutate_or_settle_original(mo
         server._sessions.pop("ui-session", None)
 
 
+def test_handler_matching_retry_while_running_replays_before_busy_rejection(monkeypatch, tmp_path):
+    profile_home = tmp_path / "profile"
+    _prepare(profile_home)
+    session = _session(profile_home)
+    server._sessions["ui-session"] = session
+    projections = []
+    monkeypatch.setattr(server, "_schedule_durable_prompt_projection", lambda *a, **k: projections.append(a))
+    try:
+        accepted = server.handle_request(_request())
+        session["running"] = True
+        replay = server.handle_request(_request())
+        assert replay["result"] == accepted["result"]
+        assert len(projections) == 1
+        assert _count(profile_home) == (1, 1)
+    finally:
+        server._sessions.pop("ui-session", None)
+
+
 def test_handler_rejects_unverified_v1_before_any_storage_write(monkeypatch, tmp_path):
     """Version, fingerprint grammar, and preimage mismatch fail closed pre-admission."""
     profile_home = tmp_path / "profile"
