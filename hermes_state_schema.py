@@ -819,6 +819,106 @@ class SessionSchemaMixin:
         finally:
             cursor.execute("PRAGMA foreign_keys=ON")
 
+    def _heal_prompt_submission_session_ownership(self, cursor: sqlite3.Cursor) -> None:
+        """Rebuild the outbox tables when legacy rows lack session ownership FKs.
+
+        Session deletion deliberately cascades terminal work and receipts: they
+        contain session-owned prompt text and must not survive as orphans.
+        Legacy orphan rows are dropped during this one-way shape migration.
+        """
+        try:
+            receipt_fks = cursor.execute(
+                'PRAGMA foreign_key_list("prompt_submission_receipts")'
+            ).fetchall()
+            work_fks = cursor.execute(
+                'PRAGMA foreign_key_list("prompt_accepted_work")'
+            ).fetchall()
+        except sqlite3.OperationalError:
+            return
+
+        def _has_session_cascade(rows):
+            return any(
+                (row[2] if isinstance(row, (tuple, list)) else row["table"]) == "sessions"
+                and (row[3] if isinstance(row, (tuple, list)) else row["from"]) == "session_id"
+                and (row[6] if isinstance(row, (tuple, list)) else row["on_delete"]).upper() == "CASCADE"
+                for row in rows
+            )
+
+        if _has_session_cascade(receipt_fks) and _has_session_cascade(work_fks):
+            return
+
+        cursor.execute("PRAGMA foreign_keys=OFF")
+        try:
+            cursor.executescript("""
+                BEGIN IMMEDIATE;
+                ALTER TABLE prompt_accepted_work RENAME TO prompt_accepted_work_legacy_session_fk;
+                ALTER TABLE prompt_submission_receipts RENAME TO prompt_submission_receipts_legacy_session_fk;
+                CREATE TABLE prompt_submission_receipts (
+                    session_id TEXT NOT NULL,
+                    submission_id TEXT NOT NULL,
+                    contract_version TEXT NOT NULL,
+                    semantic_fingerprint TEXT NOT NULL,
+                    work_id TEXT NOT NULL UNIQUE,
+                    safe_ack_json TEXT NOT NULL,
+                    created_at REAL NOT NULL,
+                    updated_at REAL NOT NULL,
+                    PRIMARY KEY (session_id, submission_id),
+                    FOREIGN KEY (session_id) REFERENCES sessions(id) ON DELETE CASCADE
+                );
+                CREATE TABLE prompt_accepted_work (
+                    work_id TEXT PRIMARY KEY,
+                    session_id TEXT NOT NULL,
+                    submission_id TEXT NOT NULL,
+                    payload_json TEXT NOT NULL,
+                    state TEXT NOT NULL,
+                    owner_token TEXT,
+                    owner_generation INTEGER NOT NULL DEFAULT 0,
+                    lease_expires_at REAL,
+                    invocation_attempt_token TEXT,
+                    invocation_attempt_no INTEGER NOT NULL DEFAULT 0,
+                    safe_terminal_json TEXT,
+                    created_at REAL NOT NULL,
+                    updated_at REAL NOT NULL,
+                    UNIQUE (session_id, submission_id),
+                    FOREIGN KEY (session_id, submission_id)
+                      REFERENCES prompt_submission_receipts(session_id, submission_id),
+                    FOREIGN KEY (session_id) REFERENCES sessions(id) ON DELETE CASCADE
+                );
+                INSERT INTO prompt_submission_receipts (
+                    session_id, submission_id, contract_version, semantic_fingerprint,
+                    work_id, safe_ack_json, created_at, updated_at
+                )
+                SELECT r.session_id, r.submission_id, r.contract_version,
+                       r.semantic_fingerprint, r.work_id, r.safe_ack_json,
+                       r.created_at, r.updated_at
+                FROM prompt_submission_receipts_legacy_session_fk r
+                JOIN sessions s ON s.id = r.session_id;
+                INSERT INTO prompt_accepted_work (
+                    work_id, session_id, submission_id, payload_json, state,
+                    owner_token, owner_generation, lease_expires_at,
+                    invocation_attempt_token, invocation_attempt_no,
+                    safe_terminal_json, created_at, updated_at
+                )
+                SELECT w.work_id, w.session_id, w.submission_id, w.payload_json,
+                       w.state, w.owner_token, w.owner_generation,
+                       w.lease_expires_at, w.invocation_attempt_token,
+                       w.invocation_attempt_no, w.safe_terminal_json,
+                       w.created_at, w.updated_at
+                FROM prompt_accepted_work_legacy_session_fk w
+                JOIN prompt_submission_receipts r ON r.work_id = w.work_id
+                JOIN sessions s ON s.id = w.session_id;
+                DROP TABLE prompt_accepted_work_legacy_session_fk;
+                DROP TABLE prompt_submission_receipts_legacy_session_fk;
+                CREATE INDEX IF NOT EXISTS idx_prompt_accepted_work_recovery
+                    ON prompt_accepted_work(state, lease_expires_at, created_at);
+                COMMIT;
+            """)
+        except Exception:
+            cursor.execute("ROLLBACK")
+            raise
+        finally:
+            cursor.execute("PRAGMA foreign_keys=ON")
+
     def _init_schema(self):
         """Create tables and FTS if they don't exist, reconcile columns.
 
@@ -853,6 +953,10 @@ class SessionSchemaMixin:
         # landed — the version-gated rebuild is unreachable there, #73823).
         # Same PK-rebuild constraint as gateway_routing above.
         self._heal_session_model_usage_pk(cursor)
+
+        # Legacy outbox tables predate their session ownership constraints;
+        # rebuild them atomically before runtime code can create new receipts.
+        self._heal_prompt_submission_session_ownership(cursor)
 
         # Indexes that reference reconciler-added columns must be created
         # AFTER _reconcile_columns runs — declaring them in SCHEMA_SQL

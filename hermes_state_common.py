@@ -535,7 +535,10 @@ CREATE TABLE IF NOT EXISTS prompt_submission_receipts (
     safe_ack_json TEXT NOT NULL,
     created_at REAL NOT NULL,
     updated_at REAL NOT NULL,
-    PRIMARY KEY (session_id, submission_id)
+    PRIMARY KEY (session_id, submission_id),
+    -- Terminal outbox state is session-owned: pruning a session intentionally
+    -- removes its receipts/work rather than retaining orphaned prompt text.
+    FOREIGN KEY (session_id) REFERENCES sessions(id) ON DELETE CASCADE
 );
 CREATE TABLE IF NOT EXISTS prompt_accepted_work (
     work_id TEXT PRIMARY KEY,
@@ -553,7 +556,8 @@ CREATE TABLE IF NOT EXISTS prompt_accepted_work (
     updated_at REAL NOT NULL,
     UNIQUE (session_id, submission_id),
     FOREIGN KEY (session_id, submission_id)
-      REFERENCES prompt_submission_receipts(session_id, submission_id)
+      REFERENCES prompt_submission_receipts(session_id, submission_id),
+    FOREIGN KEY (session_id) REFERENCES sessions(id) ON DELETE CASCADE
 );
 CREATE INDEX IF NOT EXISTS idx_prompt_accepted_work_recovery
     ON prompt_accepted_work(state, lease_expires_at, created_at);

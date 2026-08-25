@@ -16,6 +16,79 @@ _SAFE_ACTION = {
     "UNKNOWN_OUTCOME": "check_transcript_resume_or_start_new",
     "TERMINAL_ERROR": "start_new_submission",
 }
+_PAYLOAD_VERSION = 1
+_PAYLOAD_FIELDS = frozenset({
+    "text", "display_kind", "queued", "interrupted", "truncation_target",
+    "truncation_consent", "attachments",
+})
+_ATTACHMENT_FIELDS = frozenset({"identity", "version", "order", "status"})
+_DISPLAY_KINDS = frozenset({"normal", "voice", "continuation"})
+_TRUNCATION_TARGETS = frozenset({"message", "prompt", "attachment"})
+_ATTACHMENT_STATUSES = frozenset({"ready", "missing", "reattach_required"})
+_SAFE_TERMINAL_FIELDS = frozenset({"layer", "code", "retryable", "safe_action"})
+_SAFE_LAYERS = frozenset({"admission", "attachment", "provider", "recovery"})
+_SAFE_CODES = frozenset({"storage_failed", "provider_failed", "attachment_reattach_required", "unknown_outcome"})
+_SAFE_ACTIONS = frozenset(_SAFE_ACTION.values())
+
+
+def _canonical_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    """Persist only versioned replay semantics, never renderer capabilities."""
+    if not isinstance(payload, dict) or set(payload) - _PAYLOAD_FIELDS:
+        raise ValueError("ATTACHMENT_REATTACH_REQUIRED")
+    text = payload.get("text")
+    if not isinstance(text, str):
+        raise ValueError("invalid durable prompt payload")
+    display_kind = payload.get("display_kind", "normal")
+    if display_kind not in _DISPLAY_KINDS:
+        raise ValueError("invalid durable prompt payload")
+    queued = payload.get("queued", False)
+    interrupted = payload.get("interrupted", False)
+    truncation_consent = payload.get("truncation_consent", False)
+    if any(type(value) is not bool for value in (queued, interrupted, truncation_consent)):
+        raise ValueError("invalid durable prompt payload")
+    truncation_target = payload.get("truncation_target")
+    if truncation_target is not None and truncation_target not in _TRUNCATION_TARGETS:
+        raise ValueError("invalid durable prompt payload")
+    attachments = payload.get("attachments", [])
+    if not isinstance(attachments, list):
+        raise ValueError("ATTACHMENT_REATTACH_REQUIRED")
+    canonical_attachments = []
+    for attachment in attachments:
+        if not isinstance(attachment, dict) or set(attachment) != _ATTACHMENT_FIELDS:
+            raise ValueError("ATTACHMENT_REATTACH_REQUIRED")
+        identity, version, order, status = (
+            attachment["identity"], attachment["version"], attachment["order"], attachment["status"]
+        )
+        if not isinstance(identity, str) or not isinstance(version, str) or type(order) is not int or status not in _ATTACHMENT_STATUSES:
+            raise ValueError("ATTACHMENT_REATTACH_REQUIRED")
+        canonical_attachments.append({"identity": identity, "version": version, "order": order, "status": status})
+    return {
+        "payload_version": _PAYLOAD_VERSION,
+        "text": text,
+        "display_kind": display_kind,
+        "queued": queued,
+        "interrupted": interrupted,
+        "truncation_target": truncation_target,
+        "truncation_consent": truncation_consent,
+        "attachments": canonical_attachments,
+    }
+
+
+def _safe_terminal_summary(safe_terminal: dict[str, Any] | None) -> dict[str, Any]:
+    if safe_terminal is None:
+        return {}
+    if not isinstance(safe_terminal, dict) or set(safe_terminal) - _SAFE_TERMINAL_FIELDS:
+        raise ValueError("invalid durable terminal summary")
+    summary = dict(safe_terminal)
+    if "layer" in summary and summary["layer"] not in _SAFE_LAYERS:
+        raise ValueError("invalid durable terminal summary")
+    if "code" in summary and summary["code"] not in _SAFE_CODES:
+        raise ValueError("invalid durable terminal summary")
+    if "retryable" in summary and type(summary["retryable"]) is not bool:
+        raise ValueError("invalid durable terminal summary")
+    if "safe_action" in summary and summary["safe_action"] not in _SAFE_ACTIONS:
+        raise ValueError("invalid durable terminal summary")
+    return summary
 
 
 class SessionSubmissionMixin:
@@ -33,10 +106,7 @@ class SessionSubmissionMixin:
         """One BEGIN IMMEDIATE create-or-read transaction before runtime mutation."""
         if contract_version != "1":
             raise ValueError("unsupported prompt submission contract")
-        # Current attachment data is renderer-visible capability, so never accept it durably.
-        payload_wire = json.dumps(payload, sort_keys=True)
-        if any(key in payload_wire.lower() for key in ("path", "url", "token", "preview")):
-            raise ValueError("ATTACHMENT_REATTACH_REQUIRED")
+        payload_wire = json.dumps(_canonical_payload(payload), sort_keys=True, separators=(",", ":"))
         now = time.time()
         def write(conn):
             row = conn.execute("SELECT semantic_fingerprint, work_id FROM prompt_submission_receipts WHERE session_id=? AND submission_id=?", (session_id, submission_id)).fetchone()
@@ -75,15 +145,47 @@ class SessionSubmissionMixin:
 
     def complete_prompt_submission_work(self, work_id: str, *, owner_token: str, attempt_token: str, state: str, safe_terminal: dict[str, Any] | None = None) -> bool:
         if state not in _TERMINAL: raise ValueError("invalid durable terminal state")
-        summary = {k: safe_terminal[k] for k in ("layer", "code", "retryable", "safe_action") if safe_terminal and k in safe_terminal}
+        summary = _safe_terminal_summary(safe_terminal)
         return self._execute_write(lambda conn: conn.execute("UPDATE prompt_accepted_work SET state=?, safe_terminal_json=?, owner_token=NULL, lease_expires_at=NULL, updated_at=? WHERE work_id=? AND owner_token=? AND invocation_attempt_token=? AND state IN ('INVOKING','RUNNING')", (state, json.dumps(summary, sort_keys=True), time.time(), work_id, owner_token, attempt_token)).rowcount == 1)
 
-    def recover_prompt_submission_work(self, *, now: float | None = None) -> list[dict[str, Any]]:
-        """Only pre-invocation work is eligible; prior provider intent is unknown."""
+    def recover_prompt_submission_work(self, *, now: float | None = None,
+                                       live_owner_witnesses: list[dict[str, Any]] | None = None) -> list[dict[str, Any]]:
+        """Recover only pre-invocation work unless an exact live owner is proven."""
         now = time.time() if now is None else now
+        witnesses = set()
+        for witness in live_owner_witnesses or []:
+            if not isinstance(witness, dict) or set(witness) != {
+                "work_id", "owner_generation", "owner_token", "invocation_attempt_token"
+            }:
+                raise ValueError("invalid recovered live-owner witness")
+            work_id = witness["work_id"]
+            generation = witness["owner_generation"]
+            owner_token = witness["owner_token"]
+            attempt_token = witness["invocation_attempt_token"]
+            if (not isinstance(work_id, str) or type(generation) is not int
+                    or not isinstance(owner_token, str) or not isinstance(attempt_token, str)):
+                raise ValueError("invalid recovered live-owner witness")
+            witnesses.add((work_id, generation, owner_token, attempt_token))
+
         def write(conn):
-            conn.execute("UPDATE prompt_accepted_work SET state='UNKNOWN_OUTCOME', owner_token=NULL, lease_expires_at=NULL, safe_terminal_json=?, updated_at=? WHERE state IN ('INVOKING','RUNNING')", (json.dumps({"code": "unknown_outcome", "safe_action": _SAFE_ACTION["UNKNOWN_OUTCOME"]}), now))
-            conn.execute("UPDATE prompt_accepted_work SET state='ACCEPTED', owner_token=NULL, lease_expires_at=NULL, updated_at=? WHERE state='DISPATCHING' AND lease_expires_at < ?", (now, now))
+            invoking = conn.execute(
+                "SELECT work_id, owner_generation, owner_token, invocation_attempt_token, lease_expires_at "
+                "FROM prompt_accepted_work WHERE state IN ('INVOKING','RUNNING')"
+            ).fetchall()
+            unknown_ids = [
+                row["work_id"] for row in invoking
+                if row["lease_expires_at"] is None or row["lease_expires_at"] <= now
+                or (row["work_id"], row["owner_generation"], row["owner_token"], row["invocation_attempt_token"]) not in witnesses
+            ]
+            if unknown_ids:
+                placeholders = ",".join("?" for _ in unknown_ids)
+                conn.execute(
+                    f"UPDATE prompt_accepted_work SET state='UNKNOWN_OUTCOME', owner_token=NULL, "
+                    f"lease_expires_at=NULL, safe_terminal_json=?, updated_at=? "
+                    f"WHERE work_id IN ({placeholders}) AND state IN ('INVOKING','RUNNING')",
+                    (json.dumps({"code": "unknown_outcome", "safe_action": _SAFE_ACTION["UNKNOWN_OUTCOME"]}, sort_keys=True), now, *unknown_ids),
+                )
+            conn.execute("UPDATE prompt_accepted_work SET state='ACCEPTED', owner_token=NULL, lease_expires_at=NULL, updated_at=? WHERE state='DISPATCHING' AND lease_expires_at <= ?", (now, now))
             return [dict(r) for r in conn.execute("SELECT work_id, session_id, submission_id, state FROM prompt_accepted_work WHERE state IN ('ACCEPTED','QUEUED') ORDER BY created_at, work_id").fetchall()]
         return self._execute_write(write)
 
