@@ -144,13 +144,35 @@ class SessionSubmissionMixin:
             return {"created": True, "conflict": False, "work_id": work_id, "ack": ack}
         return self._execute_write(write)
 
-    def claim_prompt_submission_work(self, work_id: str, *, owner_token: str, lease_seconds: float = 30) -> dict[str, Any] | None:
+    def claim_prompt_submission_work(self, work_id: str, *, owner_token: str,
+                                     session_id: str | None = None,
+                                     lease_seconds: float = 30) -> dict[str, Any] | None:
+        """Atomically claim and return only the claimed row's canonical payload."""
         now = time.time()
         def write(conn):
-            changed = conn.execute("UPDATE prompt_accepted_work SET state='DISPATCHING', owner_token=?, owner_generation=owner_generation+1, lease_expires_at=?, updated_at=? WHERE work_id=? AND state IN ('ACCEPTED','QUEUED')", (owner_token, now + lease_seconds, now, work_id)).rowcount
-            if changed != 1: return None
-            row = conn.execute("SELECT state, owner_generation FROM prompt_accepted_work WHERE work_id=?", (work_id,)).fetchone()
-            return {"state": row[0], "owner_generation": row[1]}
+            predicate = "work_id=? AND state IN ('ACCEPTED','QUEUED')"
+            values: list[Any] = [owner_token, now + lease_seconds, now, work_id]
+            if session_id is not None:
+                predicate += " AND session_id=?"
+                values.append(session_id)
+            changed = conn.execute(
+                f"UPDATE prompt_accepted_work SET state='DISPATCHING', owner_token=?, "
+                f"owner_generation=owner_generation+1, lease_expires_at=?, updated_at=? "
+                f"WHERE {predicate}", values,
+            ).rowcount
+            if changed != 1:
+                return None
+            row = conn.execute(
+                "SELECT work_id, session_id, payload_json, state, owner_generation "
+                "FROM prompt_accepted_work WHERE work_id=? AND owner_token=?", (work_id, owner_token)
+            ).fetchone()
+            if row is None:
+                return None
+            return {
+                "work_id": row["work_id"], "session_id": row["session_id"],
+                "payload": json.loads(row["payload_json"]), "state": row["state"],
+                "owner_generation": row["owner_generation"],
+            }
         return self._execute_write(write)
 
     def mark_prompt_submission_invoking(self, work_id: str, *, owner_token: str, attempt_token: str, lease_seconds: float = 30) -> dict[str, Any] | None:
@@ -160,17 +182,35 @@ class SessionSubmissionMixin:
             return {"state": "INVOKING", "invocation_attempt_token": attempt_token} if changed == 1 else None
         return self._execute_write(write)
 
-    def mark_prompt_submission_running(self, work_id: str, *, owner_token: str, attempt_token: str) -> bool:
-        return self._execute_write(lambda conn: conn.execute("UPDATE prompt_accepted_work SET state='RUNNING', updated_at=? WHERE work_id=? AND owner_token=? AND invocation_attempt_token=? AND state='INVOKING'", (time.time(), work_id, owner_token, attempt_token)).rowcount == 1)
+    def mark_prompt_submission_running(self, work_id: str, *, owner_token: str,
+                                       attempt_token: str, lease_seconds: float = 30) -> bool:
+        now = time.time()
+        return self._execute_write(lambda conn: conn.execute(
+            "UPDATE prompt_accepted_work SET state='RUNNING', lease_expires_at=?, updated_at=? "
+            "WHERE work_id=? AND owner_token=? AND invocation_attempt_token=? AND state='INVOKING'",
+            (now + lease_seconds, now, work_id, owner_token, attempt_token),
+        ).rowcount == 1)
+
+    def renew_prompt_submission_lease(self, work_id: str, *, owner_token: str,
+                                      attempt_token: str, lease_seconds: float = 30) -> bool:
+        """Renew only the exact invocation owner/attempt currently at the boundary."""
+        now = time.time()
+        return self._execute_write(lambda conn: conn.execute(
+            "UPDATE prompt_accepted_work SET lease_expires_at=?, updated_at=? "
+            "WHERE work_id=? AND owner_token=? AND invocation_attempt_token=? "
+            "AND state IN ('INVOKING','RUNNING')",
+            (now + lease_seconds, now, work_id, owner_token, attempt_token),
+        ).rowcount == 1)
 
     def complete_prompt_submission_work(self, work_id: str, *, owner_token: str, attempt_token: str, state: str, safe_terminal: dict[str, Any] | None = None) -> bool:
         if state not in _TERMINAL: raise ValueError("invalid durable terminal state")
         summary = _safe_terminal_summary(safe_terminal)
         return self._execute_write(lambda conn: conn.execute("UPDATE prompt_accepted_work SET state=?, safe_terminal_json=?, owner_token=NULL, lease_expires_at=NULL, updated_at=? WHERE work_id=? AND owner_token=? AND invocation_attempt_token=? AND state IN ('INVOKING','RUNNING')", (state, json.dumps(summary, sort_keys=True), time.time(), work_id, owner_token, attempt_token)).rowcount == 1)
 
-    def recover_prompt_submission_work(self, *, now: float | None = None,
+    def recover_prompt_submission_work(self, *, session_id: str | None = None,
+                                       now: float | None = None,
                                        live_owner_witnesses: list[dict[str, Any]] | None = None) -> list[dict[str, Any]]:
-        """Recover only pre-invocation work unless an exact live owner is proven."""
+        """Recover a single session's work; invocation intent never auto-replays."""
         now = time.time() if now is None else now
         witnesses = set()
         for witness in live_owner_witnesses or []:
@@ -188,9 +228,15 @@ class SessionSubmissionMixin:
             witnesses.add((work_id, generation, owner_token, attempt_token))
 
         def write(conn):
+            scope = ""
+            scope_values: list[Any] = []
+            if session_id is not None:
+                scope = " AND session_id=?"
+                scope_values.append(session_id)
             invoking = conn.execute(
                 "SELECT work_id, owner_generation, owner_token, invocation_attempt_token, lease_expires_at "
-                "FROM prompt_accepted_work WHERE state IN ('INVOKING','RUNNING')"
+                "FROM prompt_accepted_work WHERE state IN ('INVOKING','RUNNING')" + scope,
+                scope_values,
             ).fetchall()
             unknown_ids = [
                 row["work_id"] for row in invoking
@@ -205,9 +251,27 @@ class SessionSubmissionMixin:
                     f"WHERE work_id IN ({placeholders}) AND state IN ('INVOKING','RUNNING')",
                     (json.dumps({"code": "unknown_outcome", "safe_action": _SAFE_ACTION["UNKNOWN_OUTCOME"]}, sort_keys=True), now, *unknown_ids),
                 )
-            conn.execute("UPDATE prompt_accepted_work SET state='ACCEPTED', owner_token=NULL, lease_expires_at=NULL, updated_at=? WHERE state='DISPATCHING' AND lease_expires_at <= ?", (now, now))
-            return [dict(r) for r in conn.execute("SELECT work_id, session_id, submission_id, state FROM prompt_accepted_work WHERE state IN ('ACCEPTED','QUEUED') ORDER BY created_at, work_id").fetchall()]
+            conn.execute(
+                "UPDATE prompt_accepted_work SET state='ACCEPTED', owner_token=NULL, "
+                "lease_expires_at=NULL, updated_at=? WHERE state='DISPATCHING' "
+                "AND lease_expires_at <= ?" + scope,
+                (now, now, *scope_values),
+            )
+            return [dict(r) for r in conn.execute(
+                "SELECT work_id, session_id, submission_id, state FROM prompt_accepted_work "
+                "WHERE state IN ('ACCEPTED','QUEUED')" + (" AND session_id=?" if session_id is not None else "") +
+                " ORDER BY created_at, work_id", scope_values,
+            ).fetchall()]
         return self._execute_write(write)
+
+    def has_unresolved_prompt_submission_work(self, session_id: str) -> bool:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT 1 FROM prompt_accepted_work WHERE session_id=? "
+                "AND state NOT IN ('COMPLETED','TERMINAL_ERROR','ATTACHMENT_REATTACH_REQUIRED','UNKNOWN_OUTCOME') LIMIT 1",
+                (session_id,),
+            ).fetchone()
+        return row is not None
 
     def prompt_submission_counts(self, session_id: str) -> tuple[int, int]:
         with self._lock:

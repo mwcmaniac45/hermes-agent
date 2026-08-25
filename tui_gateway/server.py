@@ -2547,15 +2547,52 @@ def _start_agent_build(sid: str, session: dict) -> None:
 
 
 def _schedule_durable_prompt_projection(session: dict, work_id: str) -> None:
-    """Offer committed work to the future dispatcher without invoking legacy runtime.
+    """Claim and project one text-only v1 row without re-entering prompt.submit."""
+    sid = str(session.get("session_key") or "")
+    if not sid or not work_id:
+        return
 
-    Source choice is deliberately the session-owned profile ``state.db``: the
-    receipt/outbox belongs to that stored session, never the launch/global DB.
-    This bounded seam is intentionally a no-op until legacy runtime can safely
-    project durable v1 work.  Restart recovery reads ACCEPTED/QUEUED directly
-    from that same database, so a failure here cannot lose committed intent.
-    """
-    del session, work_id
+    def dispatch() -> None:
+        owner_token = str(uuid.uuid4())
+        try:
+            with _session_db(session) as db:
+                if db is None:
+                    return
+                claim = db.claim_prompt_submission_work(
+                    work_id, owner_token=owner_token, session_id=sid,
+                )
+            if claim is None or claim.get("session_id") != sid:
+                return
+            payload = claim.get("payload")
+            if not isinstance(payload, dict) or (
+                payload.get("display_kind") != "normal" or payload.get("queued")
+                or payload.get("interrupted") or payload.get("attachments")
+                or payload.get("truncation_target") is not None
+                or payload.get("truncation_consent")
+                or not isinstance(payload.get("text"), str)
+            ):
+                return
+            with session["history_lock"]:
+                if session.get("running") or session.get("_closing") or session.get("session_key") != sid:
+                    return
+                session["running"] = True
+                session["last_active"] = time.time()
+            _start_agent_build(sid, session)
+            if _wait_agent_for_prompt(session, f"__durable__{work_id}", sid) is not None:
+                return
+            _run_prompt_submit(
+                f"__durable__{work_id}", sid, session, payload["text"],
+                durable_context={
+                    "work_id": work_id, "owner_token": owner_token,
+                    "owner_generation": claim["owner_generation"],
+                    "attempt_token": None, "session_id": sid,
+                },
+            )
+        except Exception:
+            # The durable row remains recoverable; never surface untrusted details.
+            return
+
+    threading.Thread(target=dispatch, daemon=True).start()
 
 
 def _admit_durable_prompt_submission(rid, params: dict, session: dict, text: str,
@@ -2577,19 +2614,6 @@ def _admit_durable_prompt_submission(rid, params: dict, session: dict, text: str
     for field in ("queued", "interrupted"):
         if field in params and type(params[field]) is not bool:
             return _err(rid, 4004, "invalid durable prompt submission")
-    # Today's attachment and rewind paths need legacy in-memory/path state or
-    # a destructive locked DB rewrite. Refuse every control before acceptance;
-    # v1 canonical semantics record those capabilities as explicitly unsupported.
-    if session.get("attached_images") or params.get("attachments"):
-        return _err(rid, 4092, "durable attachment replay requires reattach", data={"safe_action": "reattach_then_continue"})
-    truncation_controls = (
-        "truncate_before_user_ordinal", "truncate_before_row_id", "truncate_before_message_id",
-        "confirm_truncate", "confirm_empty_truncate",
-    )
-    if any(name in params for name in truncation_controls):
-        return _err(rid, 4092, "durable truncation is not available", data={"safe_action": "start_new_submission"})
-    if display_kind == "hidden":
-        return _err(rid, 4092, "durable hidden submission is not available", data={"safe_action": "start_new_submission"})
     canonical_semantics = build_canonical_semantic_object(
         text_sha256=compute_text_sha256(text),
         display_kind=DisplayKind.NORMAL,
@@ -2603,6 +2627,25 @@ def _admit_durable_prompt_submission(rid, params: dict, session: dict, text: str
     )
     if compute_semantic_fingerprint(canonical_semantics) != claimed_fingerprint:
         return _err(rid, 4004, "invalid durable prompt submission")
+    # v1 is deliberately text-only, normal, and idle-only. These guards run
+    # before create-or-read so unsupported semantics cannot mint a receipt.
+    with session["history_lock"]:
+        busy = bool(session.get("running"))
+    if busy or params.get("queued") is True or params.get("interrupted") is True:
+        return _err(rid, 4092, "durable busy submission is not available", data={"safe_action": "start_new_submission"})
+    # Today's attachment and rewind paths need legacy in-memory/path state or
+    # a destructive locked DB rewrite. Refuse every control before acceptance;
+    # v1 canonical semantics record those capabilities as explicitly unsupported.
+    if session.get("attached_images") or params.get("attachments"):
+        return _err(rid, 4092, "durable attachment replay requires reattach", data={"safe_action": "reattach_then_continue"})
+    truncation_controls = (
+        "truncate_before_user_ordinal", "truncate_before_row_id", "truncate_before_message_id",
+        "confirm_truncate", "confirm_empty_truncate",
+    )
+    if any(name in params for name in truncation_controls):
+        return _err(rid, 4092, "durable truncation is not available", data={"safe_action": "start_new_submission"})
+    if display_kind == "hidden":
+        return _err(rid, 4092, "durable hidden submission is not available", data={"safe_action": "start_new_submission"})
     try:
         # The session FK is an ownership prerequisite, not prompt projection.
         # _ensure_session_db_row and _session_db share the profile-aware source.
@@ -8864,6 +8907,15 @@ def _schedule_resume_hydration(
                     "status": "complete",
                 },
             )
+            # Durable work owns its own recovery boundary and must never cross
+            # the legacy raw-prompt auto-continue marker path.
+            if hasattr(db, "recover_prompt_submission_work"):
+                had_unresolved_durable = db.has_unresolved_prompt_submission_work(stored_id)
+                recovered_durable = db.recover_prompt_submission_work(session_id=stored_id)
+                if had_unresolved_durable or recovered_durable:
+                    clear_turn_marker(_session_home(session), stored_id)
+                for recovered in recovered_durable:
+                    _schedule_durable_prompt_projection(session, recovered["work_id"])
             _maybe_schedule_auto_continue(sid, session, stored_id)
             _start_agent_build(sid, session)
         except Exception as exc:
@@ -10843,6 +10895,7 @@ def _run_prompt_submit(
     display_metadata: dict | None = None,
     image_paths: list[str] | None = None,
     queued_prompt_generation: int | None = None,
+    durable_context: dict[str, Any] | None = None,
 ) -> bool:
     with session["history_lock"]:
         if session.get("_closing"):
@@ -10924,7 +10977,7 @@ def _run_prompt_submit(
         marker_key = str(session.get("session_key") or "")
         marker_attempt = int(session.pop("_auto_continue_attempt", 0) or 0)
         marker_text = session.pop("_auto_continue_prompt", None) or text
-        if isinstance(marker_text, str) and marker_text.strip():
+        if durable_context is None and isinstance(marker_text, str) and marker_text.strip():
             record_turn_start(marker_home, marker_key, marker_text, attempts=marker_attempt)
         try:
             from tools.approval import (
@@ -11183,10 +11236,69 @@ def _run_prompt_submit(
             agent._on_session_title = lambda t, _src, _k=_title_key: _emit(
                 "session.title", sid, {"session_id": _k, "title": t}
             )
+            lease_stop = None
+            lease_thread = None
+            if durable_context is not None:
+                attempt_token = str(uuid.uuid4())
+                try:
+                    with _session_db(session) as durable_db:
+                        invoking = durable_db is not None and durable_db.mark_prompt_submission_invoking(
+                            durable_context["work_id"], owner_token=durable_context["owner_token"],
+                            attempt_token=attempt_token,
+                        )
+                except Exception:
+                    return
+                if invoking is None:
+                    return
+                durable_context["attempt_token"] = attempt_token
+                try:
+                    with _session_db(session) as durable_db:
+                        running = durable_db is not None and durable_db.mark_prompt_submission_running(
+                            durable_context["work_id"], owner_token=durable_context["owner_token"],
+                            attempt_token=attempt_token,
+                        )
+                except Exception:
+                    return
+                if not running:
+                    return
+                lease_stop = threading.Event()
+
+                def _renew_durable_lease() -> None:
+                    while not lease_stop.wait(10.0):
+                        try:
+                            with _session_db(session) as durable_db:
+                                if durable_db is None or not durable_db.renew_prompt_submission_lease(
+                                    durable_context["work_id"], owner_token=durable_context["owner_token"],
+                                    attempt_token=durable_context["attempt_token"],
+                                ):
+                                    return
+                        except Exception:
+                            return
+
+                lease_thread = _RealThread(target=_renew_durable_lease, daemon=True)
+                lease_thread.start()
             _usage_stop, _usage_thread = _start_usage_ticker(sid, agent)
             try:
                 result = agent.run_conversation(run_message, **run_kwargs)
+            except Exception:
+                if durable_context is not None:
+                    try:
+                        with _session_db(session) as durable_db:
+                            if durable_db is not None:
+                                durable_db.complete_prompt_submission_work(
+                                    durable_context["work_id"], owner_token=durable_context["owner_token"],
+                                    attempt_token=durable_context["attempt_token"], state="UNKNOWN_OUTCOME",
+                                    safe_terminal={"layer": "recovery", "code": "unknown_outcome", "retryable": False,
+                                                   "safe_action": "check_transcript_resume_or_start_new"},
+                                )
+                    except Exception:
+                        pass
+                return
             finally:
+                if lease_stop is not None:
+                    lease_stop.set()
+                if lease_thread is not None:
+                    lease_thread.join()
                 # Stop AND join before anything below emits: an in-flight tick
                 # surviving past message.complete would roll the client's final
                 # usage back to a stale mid-turn snapshot. The join is
@@ -11198,6 +11310,23 @@ def _run_prompt_submit(
                 # message.complete.
                 _usage_stop.set()
                 _usage_thread.join()
+            if durable_context is not None:
+                terminal_state = "TERMINAL_ERROR" if isinstance(result, dict) and result.get("error") else "COMPLETED"
+                terminal = (
+                    {"layer": "provider", "code": "provider_failed", "retryable": False,
+                     "safe_action": "start_new_submission"}
+                    if terminal_state == "TERMINAL_ERROR" else None
+                )
+                try:
+                    with _session_db(session) as durable_db:
+                        if durable_db is None or not durable_db.complete_prompt_submission_work(
+                            durable_context["work_id"], owner_token=durable_context["owner_token"],
+                            attempt_token=durable_context["attempt_token"], state=terminal_state,
+                            safe_terminal=terminal,
+                        ):
+                            return
+                except Exception:
+                    return
             if display_kind and isinstance(text, str):
                 db = getattr(agent, "_session_db", None)
                 current_session_id = getattr(agent, "session_id", None) or session.get("session_key")
