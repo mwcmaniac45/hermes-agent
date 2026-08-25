@@ -2673,6 +2673,20 @@ def _schedule_durable_prompt_projection(session: dict, work_id: str) -> None:
                     sid, session, durable_context, started=False, invocation_started=False
                 )
                 return
+            with session["history_lock"]:
+                durable_dispatch_cancelled = (
+                    session.get("session_key") != sid
+                    or durable_context.get("session_id") != sid
+                    or session.get("_durable_projection_work_id") != work_id
+                    or session.get("_turn_cancel_requested")
+                    or not session.get("running")
+                    or session.get("_closing")
+                )
+                if durable_dispatch_cancelled:
+                    _refuse_durable_preprovider_projection(
+                        sid, session, durable_context, started=False, invocation_started=False
+                    )
+                    return
             if not _run_prompt_submit(
                 f"__durable__{work_id}", sid, session, payload["text"],
                 durable_context=durable_context,
@@ -11011,6 +11025,18 @@ def _run_prompt_submit(
     durable_context: dict[str, Any] | None = None,
 ) -> bool:
     with session["history_lock"]:
+        if durable_context is not None and (
+            session.get("session_key") != sid
+            or durable_context.get("session_id") != sid
+            or session.get("_durable_projection_work_id") != durable_context.get("work_id")
+            or session.get("_turn_cancel_requested")
+            or not session.get("running")
+            or session.get("_closing")
+        ):
+            _refuse_durable_preprovider_projection(
+                sid, session, durable_context, started=False, invocation_started=False
+            )
+            return False
         if session.get("_closing"):
             if durable_context is not None:
                 _refuse_durable_preprovider_projection(

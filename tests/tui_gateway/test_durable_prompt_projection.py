@@ -257,6 +257,80 @@ def test_scheduler_projects_real_accepted_work_to_completed_before_exact_replay(
     assert session["running"] is False
 
 
+def test_scheduler_cancellation_during_real_wait_releases_before_provider_entry(monkeypatch, tmp_path):
+    """A cancelled durable wait must release its claim without starting a turn."""
+    profile = tmp_path / "profile"
+    profile.mkdir()
+    db = SessionDB(db_path=profile / "state.db")
+    db.create_session("session-a", "tui")
+    work = _work(db)
+    db.close()
+    session = _session(profile)
+    wait_entered, provider_entered = threading.Event(), threading.Event()
+    emitted, marker_starts, dispatch_threads = [], [], []
+
+    class ObservedReady(threading.Event):
+        def wait(self, timeout=None):
+            wait_entered.set()
+            return super().wait(timeout)
+
+    class DispatchThread:
+        def __init__(self, *, target, daemon):
+            self.thread = server._RealThread(target=target, daemon=daemon)
+            dispatch_threads.append(self.thread)
+
+        def start(self):
+            self.thread.start()
+
+    class JoinedThread:
+        def join(self):
+            return None
+
+    class Agent:
+        session_id = "session-a"
+        provider = "test"
+        model = "test"
+        interim_assistant_callback = None
+
+        def run_conversation(self, *_args, **_kwargs):
+            provider_entered.set()
+            return {"final_response": "unexpected"}
+
+    session["agent_ready"] = ObservedReady()
+    session["agent"] = Agent()
+    monkeypatch.setattr(server.threading, "Thread", DispatchThread)
+    monkeypatch.setattr(server, "_start_agent_build", lambda *_args: None)
+    monkeypatch.setattr(server, "_sync_agent_model_with_config", lambda *_args: None)
+    monkeypatch.setattr(server, "_sync_bot_capabilities", lambda *_args: None)
+    monkeypatch.setattr(server, "_start_usage_ticker", lambda *_args: (threading.Event(), JoinedThread()))
+    monkeypatch.setattr(server, "_get_usage", lambda *_args: {})
+    monkeypatch.setattr(server, "_emit", lambda *args: emitted.append(args))
+    monkeypatch.setattr(server, "record_turn_start", lambda *args, **kwargs: marker_starts.append(args))
+
+    server._schedule_durable_prompt_projection(session, work["work_id"])
+    assert wait_entered.wait(timeout=1)
+    with session["history_lock"]:
+        session["_turn_cancel_requested"] = True
+    session["agent_ready"].set()
+    dispatch_threads[0].join(timeout=1)
+
+    assert not provider_entered.wait(timeout=0.2)
+    check = SessionDB(db_path=profile / "state.db")
+    try:
+        replay = check.create_or_read_prompt_submission(
+            session_id="session-a", submission_id="submission-a", contract_version="1",
+            semantic_fingerprint="a" * 64, payload={"text": "private text"},
+        )
+        assert replay["ack"]["invocation_status"] == "accepted"
+    finally:
+        check.close()
+    assert session["running"] is False
+    assert "_durable_projection_work_id" not in session
+    assert not session.get("inflight_turn")
+    assert not any(event[0] == "message.start" for event in emitted)
+    assert marker_starts == []
+
+
 @pytest.mark.parametrize(
     ("transition", "raises"),
     (("invoking", False), ("invoking", True), ("running", False), ("running", True)),
