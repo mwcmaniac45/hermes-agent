@@ -1,0 +1,30 @@
+{
+  "run_id": "01M0X4MGSFNZC62HND6JBN8XMP",
+  "state": "PLANNING",
+  "cycle": 1,
+  "current_spec_id": "",
+  "plan_revisions": 0,
+  "impl_retries": 0,
+  "max_cycles": 3,
+  "spend_usd": 0,
+  "config": {
+    "run_id": "01M0X4MGSFNZC62HND6JBN8XMP",
+    "brief": "Implement the owner-approved, independently reviewed Hermes Desktop/Gateway submission-recovery plan exactly as written. The supplied absolute plan is canonical. Work only in this run's isolated worktree. Follow strict serial RED → GREEN TDD, preserve the plan's bounded guarantees and unknown-outcome behavior, record actual tests, conduct required browser/UI QA, then complete governed review, a scoped commit, and a PR. Do not modify unrelated files, configuration, provider policy, secrets, or MWC artifacts.",
+    "project_path": "/Users/joshuaingram/.hermes/.pa-worktrees-hermes-agent/01M0X4MGSFNZC62HND6JBN8XMP",
+    "mode": "cloud",
+    "execution": "default",
+    "plan_approval": "autonomous",
+    "review_depth": "full",
+    "project_type": "api",
+    "implementer_rotation": "alternate",
+    "iteration_cap": 3,
+    "spend_cap_usd": 10,
+    "visual_regression": "baseline",
+    "notifications": "completion-halts",
+    "escalate": false,
+    "plan_path": "/Users/joshuaingram/.hermes/.pa-worktrees-hermes-agent/01M0WYR7H4N341TF4AXBVG0PJY/.autonomous/plan-under-review.md",
+    "plan_review_mode": "never",
+    "clear_circuit": true
+  },
+  "timestamp": "2026-08-25T18:59:02.425Z"
+}
