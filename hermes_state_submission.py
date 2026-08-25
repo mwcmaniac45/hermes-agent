@@ -6,6 +6,7 @@ handling must never settle these records: only owner and attempt tokens can.
 from __future__ import annotations
 
 import json
+import re
 import time
 import uuid
 from typing import Any
@@ -29,6 +30,20 @@ _SAFE_TERMINAL_FIELDS = frozenset({"layer", "code", "retryable", "safe_action"})
 _SAFE_LAYERS = frozenset({"admission", "attachment", "provider", "recovery"})
 _SAFE_CODES = frozenset({"storage_failed", "provider_failed", "attachment_reattach_required", "unknown_outcome"})
 _SAFE_ACTIONS = frozenset(_SAFE_ACTION.values())
+# Durable attachment strings are opaque local metadata, never renderer handles:
+# identity is a 1-64 ASCII identifier; version is a v-prefixed numeric version.
+_OPAQUE_ATTACHMENT_IDENTITY = re.compile(r"[A-Za-z][A-Za-z0-9_-]{0,63}\Z")
+_OPAQUE_ATTACHMENT_VERSION = re.compile(r"v[0-9]+(?:\.[0-9]+){0,3}\Z")
+_CAPABILITY_WORDS = frozenset({"bearer", "token", "secret", "authorization", "credential", "capability"})
+
+
+def _is_safe_attachment_opaque(value: Any, pattern: re.Pattern[str]) -> bool:
+    """Accept only bounded non-capability local attachment metadata."""
+    return (
+        isinstance(value, str)
+        and pattern.fullmatch(value) is not None
+        and not any(word in value.casefold() for word in _CAPABILITY_WORDS)
+    )
 
 
 def _canonical_payload(payload: dict[str, Any]) -> dict[str, Any]:
@@ -59,7 +74,12 @@ def _canonical_payload(payload: dict[str, Any]) -> dict[str, Any]:
         identity, version, order, status = (
             attachment["identity"], attachment["version"], attachment["order"], attachment["status"]
         )
-        if not isinstance(identity, str) or not isinstance(version, str) or type(order) is not int or status not in _ATTACHMENT_STATUSES:
+        if (
+            not _is_safe_attachment_opaque(identity, _OPAQUE_ATTACHMENT_IDENTITY)
+            or not _is_safe_attachment_opaque(version, _OPAQUE_ATTACHMENT_VERSION)
+            or type(order) is not int
+            or status not in _ATTACHMENT_STATUSES
+        ):
             raise ValueError("ATTACHMENT_REATTACH_REQUIRED")
         canonical_attachments.append({"identity": identity, "version": version, "order": order, "status": status})
     return {

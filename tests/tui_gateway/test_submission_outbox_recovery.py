@@ -101,6 +101,37 @@ def test_payload_is_structural_allowlist_and_benign_text_keeps_ordinary_words(tm
         db.close()
 
 
+@pytest.mark.parametrize(
+    "field, hostile",
+    [
+        (field, hostile)
+        for field in ("identity", "version", "status")
+        for hostile in (
+            "https://secret.example/file?token=abc",
+            "/Users/alice/private.png",
+            "../private.png",
+            "Bearer secret-token-value",
+        )
+    ],
+)
+def test_attachment_persisted_strings_reject_capabilities_before_payload_json(tmp_path, field, hostile):
+    """Only conservative opaque attachment metadata may enter the durable payload."""
+    db = _db_with_session(tmp_path / "state.db")
+    try:
+        attachment = {"identity": "attachment-1", "version": "v1", "order": 0, "status": "ready"}
+        attachment[field] = hostile
+        with pytest.raises(ValueError, match="ATTACHMENT_REATTACH_REQUIRED"):
+            db.create_or_read_prompt_submission(
+                session_id="stored-session", submission_id=f"hostile-{field}", contract_version="1",
+                semantic_fingerprint="4" * 64, payload={"text": "allowed", "attachments": [attachment]},
+            )
+        assert db.prompt_submission_counts("stored-session") == (0, 0)
+        assert db._conn is not None
+        assert db._conn.execute("SELECT COUNT(payload_json) FROM prompt_accepted_work").fetchone()[0] == 0
+    finally:
+        db.close()
+
+
 def test_conflicting_same_id_cannot_settle_original_pending_work(tmp_path):
     """A mismatch must not alter the original receipt or its later completion."""
     db = _db_with_session(tmp_path / "state.db")
@@ -144,8 +175,8 @@ def test_conflicting_same_id_cannot_settle_original_pending_work(tmp_path):
         db.close()
 
 
-def test_real_sessiondb_barrier_race_creates_one_receipt_and_one_work(tmp_path):
-    """The transaction barrier proves the losing same-fingerprint caller is read-only."""
+def test_real_sessiondb_barrier_race_replays_same_fingerprint_once(tmp_path):
+    """Two connections race one identity and replay the sole durable receipt/work."""
     path = tmp_path / "state.db"
     entered, release = threading.Event(), threading.Event()
     first = _db_with_session(path)
@@ -162,16 +193,17 @@ def test_real_sessiondb_barrier_race_creates_one_receipt_and_one_work(tmp_path):
     thread = threading.Thread(target=first_writer)
     thread.start()
     assert entered.wait(2)
-    # A mismatch waits for the real SQLite transaction then returns only 4091.
-    conflict = []
-    mismatch = threading.Thread(target=lambda: conflict.append(second.create_or_read_prompt_submission(
+    replay = []
+    second_writer = threading.Thread(target=lambda: replay.append(second.create_or_read_prompt_submission(
         session_id="stored-session", submission_id="race-1", contract_version="1",
-        semantic_fingerprint="d" * 64, payload={"text": "other"},
+        semantic_fingerprint="c" * 64, payload={"text": "private"},
     )))
-    mismatch.start()
-    release.set(); thread.join(3); mismatch.join(3)
-    assert results[0]["created"] is True
-    assert conflict == [{"created": False, "conflict": True, "code": 4091}]
+    second_writer.start()
+    release.set(); thread.join(3); second_writer.join(3)
+    assert [result["created"] for result in results + replay].count(True) == 1
+    assert [result["created"] for result in results + replay].count(False) == 1
+    assert replay[0]["conflict"] is False
+    assert results[0]["work_id"] == replay[0]["work_id"]
     assert first.prompt_submission_counts("stored-session") == (1, 1)
     first.close(); second.close()
 
