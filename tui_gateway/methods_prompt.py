@@ -265,6 +265,63 @@ def _pending_reaction_notes(session: dict) -> str:
     return "\n".join(notes)
 
 
+def _admit_id_bearing_prompt_submission(rid, params: dict, session: dict, text, display_kind):
+    """Validate canonical semantics and reserve the id before side effects."""
+    submission_id = params.get("submission_id")
+    if submission_id is None:
+        return None
+
+    from tui_gateway.prompt_submission_contract import (
+        DisplayKind,
+        build_canonical_semantic_object,
+        compute_semantic_fingerprint,
+        compute_text_sha256,
+        validate_request_from_dict,
+    )
+
+    try:
+        request = validate_request_from_dict(params)
+    except ValueError:
+        return _err(rid, 4004, "invalid prompt submission admission fields")
+    # Existing attachment storage has only renderer-visible paths. Do not use
+    # those paths as identities; spec-03 owns opaque replay-handle admission.
+    if session.get("attached_images"):
+        return _err(rid, 4004, "id-bearing submissions require attachment identities")
+    target = None
+    if params.get("truncate_before_row_id") is not None:
+        target = f"row_id:{params['truncate_before_row_id']}"
+    elif params.get("truncate_before_message_id") is not None:
+        target = f"message_id:{params['truncate_before_message_id']}"
+    elif params.get("truncate_before_user_ordinal") is not None:
+        target = f"ordinal:{params['truncate_before_user_ordinal']}"
+    canonical = build_canonical_semantic_object(
+        text_sha256=compute_text_sha256(text) if isinstance(text, str) else "",
+        display_kind=DisplayKind.NORMAL if display_kind is None else display_kind,
+        queued=bool(params.get("queued")),
+        interrupted=bool(params.get("interrupted")),
+        surface="hud" if params.get("surface") == "hud" else "",
+        truncation_target=target,
+        truncation_consent=is_truthy_value(params.get("confirm_truncate")),
+        attachments=[],
+        replay_controls={
+            "confirm_empty_truncate": is_truthy_value(
+                params.get("confirm_empty_truncate")
+            )
+        },
+    )
+    fingerprint = compute_semantic_fingerprint(canonical)
+    if request.semantic_fingerprint != fingerprint:
+        return _err(rid, 4004, "semantic fingerprint does not match request")
+    decision, data = create_or_read_prompt_submission(
+        session, request.submission_id, fingerprint
+    )
+    if decision == "created":
+        return None
+    if decision == "existing":
+        return _ok(rid, data)
+    return _err(rid, 4091, "submission id conflicts with prior request", data=data)
+
+
 @method("prompt.submit")
 def _(rid, params: dict) -> dict:
     from hermes_cli.input_sanitize import sanitize_user_prompt_text
@@ -276,6 +333,16 @@ def _(rid, params: dict) -> dict:
     # client renders it as a bubble. Whitelisted to "hidden" — display_kind
     # is a DB-only sidecar and this RPC must not mint arbitrary kinds.
     display_kind = "hidden" if params.get("display_kind") == "hidden" else None
+    session = None
+    if params.get("submission_id") is not None:
+        session, err = _sess_nowait(params, rid)
+        if err:
+            return err
+        admission = _admit_id_bearing_prompt_submission(
+            rid, params, session, text, display_kind
+        )
+        if admission is not None:
+            return admission
     # Typed bare stop phrase while backend voice mode is active ends the
     # voice chat instead of sending "stop" to the agent — the typed twin of
     # the spoken stop phrase (PR #73106), applied at the ONE server-side
@@ -306,6 +373,10 @@ def _(rid, params: dict) -> dict:
             _voice_emit("voice.transcript", {"stop_phrase": True, "typed": True})
             logger.info("prompt.submit: typed stop phrase — voice chat ended")
             return _ok(rid, {"voice_stopped": True})
+    if session is None:
+        session, err = _sess_nowait(params, rid)
+        if err:
+            return err
     truncate_user_ordinal = params.get("truncate_before_user_ordinal")
     if params.get("interrupted"):
         # Client-side barge-in (desktop VAD / typing over playback) — latch it
@@ -313,9 +384,6 @@ def _(rid, params: dict) -> dict:
         from tools.tts_streaming import mark_speech_interrupted
 
         mark_speech_interrupted()
-    session, err = _sess_nowait(params, rid)
-    if err:
-        return err
     if (limit_message := _ensure_active_session_slot(sid, session)) is not None:
         return _err(rid, 4090, limit_message)
     # Which desktop window this message was typed into. Rewritten on every
@@ -1558,6 +1626,7 @@ def register(server) -> None:
         _coerce_truncate_int,
         _reconcile_client_ordinal,
         _pending_reaction_notes,
+        _admit_id_bearing_prompt_submission,
     ):
         setattr(
             server,
