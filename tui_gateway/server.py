@@ -2574,6 +2574,9 @@ def _admit_durable_prompt_submission(rid, params: dict, session: dict, text: str
         or not isinstance(text, str)
     ):
         return _err(rid, 4004, "invalid durable prompt submission")
+    for field in ("queued", "interrupted"):
+        if field in params and type(params[field]) is not bool:
+            return _err(rid, 4004, "invalid durable prompt submission")
     # Today's attachment and rewind paths need legacy in-memory/path state or
     # a destructive locked DB rewrite. Refuse every control before acceptance;
     # v1 canonical semantics record those capabilities as explicitly unsupported.

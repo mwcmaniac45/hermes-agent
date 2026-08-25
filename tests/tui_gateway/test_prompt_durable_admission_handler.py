@@ -131,6 +131,48 @@ def test_handler_rejects_unverified_v1_before_any_storage_write(monkeypatch, tmp
         server._sessions.pop("ui-session", None)
 
 
+@pytest.mark.parametrize("field", ("queued", "interrupted"))
+@pytest.mark.parametrize("wire_value", ("false", 1, None, [], {}))
+def test_handler_rejects_non_boolean_durable_control_before_any_mutation(
+    monkeypatch, tmp_path, field, wire_value
+):
+    """Present durable flags must be JSON booleans, never truthy wire values."""
+    profile_home = tmp_path / "profile"
+    _prepare(profile_home)
+    session = _session(profile_home)
+    server._sessions["ui-session"] = session
+    attempted_writes, mutations = [], []
+    monkeypatch.setattr(
+        server, "_ensure_session_db_row", lambda *a, **k: attempted_writes.append("ensure")
+    )
+    for name in (
+        "_ensure_active_session_slot", "_handle_busy_submit", "_start_inflight_turn",
+        "_start_agent_build", "_run_prompt_submit",
+    ):
+        monkeypatch.setattr(server, name, lambda *a, _name=name, **k: mutations.append(_name))
+    try:
+        fingerprint = _fingerprint(
+            text="private text",
+            queued=bool(wire_value) if field == "queued" else False,
+            interrupted=bool(wire_value) if field == "interrupted" else False,
+        )
+        response = server.handle_request(_request(
+            submission_id=f"non-bool-{field}-{type(wire_value).__name__}",
+            fingerprint=fingerprint,
+            **{field: wire_value},
+        ))
+        assert response is not None
+        assert response["error"] == {
+            "code": 4004, "message": "invalid durable prompt submission"
+        }
+        assert attempted_writes == []
+        assert mutations == []
+        assert _count(profile_home) == (0, 0)
+        assert session["client_surface"] == "" and session["running"] is False
+    finally:
+        server._sessions.pop("ui-session", None)
+
+
 def test_handler_same_id_changed_semantics_never_replays_prior_ack(monkeypatch, tmp_path):
     """A claimed fingerprint cannot bind changed admitted text or flags to old work."""
     profile_home = tmp_path / "profile"
