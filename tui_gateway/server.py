@@ -2673,9 +2673,12 @@ def _schedule_durable_prompt_projection(session: dict, work_id: str) -> None:
                     sid, session, durable_context, started=False, invocation_started=False
                 )
                 return
+            with _sessions_lock:
+                current_session = _sessions.get(sid)
             with session["history_lock"]:
                 durable_dispatch_cancelled = (
-                    session.get("session_key") != sid
+                    current_session is not session
+                    or session.get("session_key") != sid
                     or durable_context.get("session_id") != sid
                     or session.get("_durable_projection_work_id") != work_id
                     or session.get("_turn_cancel_requested")
@@ -11024,9 +11027,12 @@ def _run_prompt_submit(
     queued_prompt_generation: int | None = None,
     durable_context: dict[str, Any] | None = None,
 ) -> bool:
+    with _sessions_lock:
+        current_session = _sessions.get(sid)
     with session["history_lock"]:
         if durable_context is not None and (
-            session.get("session_key") != sid
+            current_session is not session
+            or session.get("session_key") != sid
             or durable_context.get("session_id") != sid
             or session.get("_durable_projection_work_id") != durable_context.get("work_id")
             or session.get("_turn_cancel_requested")

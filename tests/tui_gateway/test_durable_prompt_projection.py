@@ -47,7 +47,7 @@ def _fingerprint(text, *, queued=False, interrupted=False):
 
 
 def _session(profile_home, session_id="session-a"):
-    return {
+    session = {
         "session_key": session_id,
         "profile_home": str(profile_home),
         "history": [],
@@ -55,6 +55,19 @@ def _session(profile_home, session_id="session-a"):
         "running": False,
         "client_surface": "",
     }
+    with server._sessions_lock:
+        server._sessions[session_id] = session
+    return session
+
+
+@pytest.fixture(autouse=True)
+def _clear_test_session_registry():
+    """Keep each durable scheduler test on its own live session generation."""
+    with server._sessions_lock:
+        server._sessions.pop("session-a", None)
+    yield
+    with server._sessions_lock:
+        server._sessions.pop("session-a", None)
 
 
 def test_claim_returns_only_claimed_canonical_payload_and_session_identity(tmp_path):
@@ -331,6 +344,89 @@ def test_scheduler_cancellation_during_real_wait_releases_before_provider_entry(
     assert marker_starts == []
 
 
+def test_scheduler_registry_replacement_during_real_wait_releases_before_turn_start(monkeypatch, tmp_path):
+    """A replaced durable session must release before it creates or starts a turn."""
+    profile = tmp_path / "profile"
+    profile.mkdir()
+    db = SessionDB(db_path=profile / "state.db")
+    db.create_session("session-a", "tui")
+    work = _work(db)
+    db.close()
+    session = _session(profile)
+    replacement = _session(profile)
+    replacement_state = dict(replacement)
+    replacement_state.pop("history_lock")
+    wait_entered, provider_entered = threading.Event(), threading.Event()
+    emitted, marker_starts, dispatch_threads = [], [], []
+
+    class ObservedReady(threading.Event):
+        def wait(self, timeout=None):
+            wait_entered.set()
+            return super().wait(timeout)
+
+    class DispatchThread:
+        def __init__(self, *, target, daemon):
+            self.thread = server._RealThread(target=target, daemon=daemon)
+            dispatch_threads.append(self.thread)
+
+        def start(self):
+            self.thread.start()
+
+    class JoinedThread:
+        def join(self):
+            return None
+
+    class Agent:
+        session_id = "session-a"
+        provider = "test"
+        model = "test"
+        interim_assistant_callback = None
+
+        def run_conversation(self, *_args, **_kwargs):
+            provider_entered.set()
+            return {"final_response": "unexpected"}
+
+    session["agent_ready"] = ObservedReady()
+    session["agent"] = Agent()
+    monkeypatch.setattr(server.threading, "Thread", DispatchThread)
+    monkeypatch.setattr(server, "_start_agent_build", lambda *_args: None)
+    monkeypatch.setattr(server, "_sync_agent_model_with_config", lambda *_args: None)
+    monkeypatch.setattr(server, "_sync_bot_capabilities", lambda *_args: None)
+    monkeypatch.setattr(server, "_start_usage_ticker", lambda *_args: (threading.Event(), JoinedThread()))
+    monkeypatch.setattr(server, "_get_usage", lambda *_args: {})
+    monkeypatch.setattr(server, "_emit", lambda *args: emitted.append(args))
+    monkeypatch.setattr(server, "record_turn_start", lambda *args, **kwargs: marker_starts.append(args))
+    with server._sessions_lock:
+        server._sessions["session-a"] = session
+    try:
+        server._schedule_durable_prompt_projection(session, work["work_id"])
+        assert wait_entered.wait(timeout=1)
+        with server._sessions_lock:
+            server._sessions["session-a"] = replacement
+        session["agent_ready"].set()
+        dispatch_threads[0].join(timeout=1)
+
+        assert not provider_entered.wait(timeout=0.2)
+        check = SessionDB(db_path=profile / "state.db")
+        try:
+            replay = check.create_or_read_prompt_submission(
+                session_id="session-a", submission_id="submission-a", contract_version="1",
+                semantic_fingerprint="a" * 64, payload={"text": "private text"},
+            )
+            assert replay["ack"]["invocation_status"] == "accepted"
+        finally:
+            check.close()
+        assert session["running"] is False
+        assert "_durable_projection_work_id" not in session
+        assert not session.get("inflight_turn")
+        assert not any(event[0] == "message.start" for event in emitted)
+        assert marker_starts == []
+        assert {key: value for key, value in replacement.items() if key != "history_lock"} == replacement_state
+    finally:
+        with server._sessions_lock:
+            server._sessions.pop("session-a", None)
+
+
 @pytest.mark.parametrize(
     ("transition", "raises"),
     (("invoking", False), ("invoking", True), ("running", False), ("running", True)),
@@ -425,7 +521,8 @@ def test_scheduler_preprovider_entry_races_release_claim_and_close_started_ui(mo
     if race == "closing":
         session["_closing"] = True
     else:
-        server._sessions["session-a"] = {"replacement": True}
+        with server._sessions_lock:
+            server._sessions["session-a"] = {"replacement": True}
     monkeypatch.setattr(server.threading, "Thread", InlineThread)
     monkeypatch.setattr(server, "_start_agent_build", lambda *_a: None)
     monkeypatch.setattr(server, "_wait_agent_for_prompt", lambda *_a: None)
@@ -448,7 +545,7 @@ def test_scheduler_preprovider_entry_races_release_claim_and_close_started_ui(mo
     assert session["running"] is False
     assert not session.get("inflight_turn")
     if race == "replacement":
-        assert any(event[0] == "message.complete" and event[2]["status"] == "error" for event in emitted)
+        assert not any(event[0] == "message.start" for event in emitted)
 
 
 def test_scheduler_invalid_payload_releases_without_agent_or_provider(monkeypatch, tmp_path):
