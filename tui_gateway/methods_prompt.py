@@ -274,8 +274,22 @@ def _(rid, params: dict) -> dict:
     text = sanitize_user_prompt_text(raw_text) if isinstance(raw_text, str) else raw_text
     # Off-screen sends (widget intents): type the persisted user row so no
     # client renders it as a bubble. Whitelisted to "hidden" — display_kind
-    # is a DB-only sidecar and this RPC must not mint arbitrary kinds.
+    # is DB-only sidecar and this RPC must not mint arbitrary kinds.
     display_kind = "hidden" if params.get("display_kind") == "hidden" else None
+    # Id-bearing v1 resolves/adopts before *any* request-derived effect,
+    # including the typed voice-stop branch below.  No-id callers retain their
+    # historical voice path, which intentionally permits a stop without a live
+    # conversation session.
+    session = None
+    if any(name in params for name in ("submission_id", "contract_version", "semantic_fingerprint")):
+        session, err = _sess_nowait(params, rid)
+        if err:
+            return err
+        durable_response = _admit_durable_prompt_submission(
+            rid, params, session, text, display_kind
+        )
+        if durable_response is not None:
+            return durable_response
     # Typed bare stop phrase while backend voice mode is active ends the
     # voice chat instead of sending "stop" to the agent — the typed twin of
     # the spoken stop phrase (PR #73106), applied at the ONE server-side
@@ -313,9 +327,10 @@ def _(rid, params: dict) -> dict:
         from tools.tts_streaming import mark_speech_interrupted
 
         mark_speech_interrupted()
-    session, err = _sess_nowait(params, rid)
-    if err:
-        return err
+    if session is None:
+        session, err = _sess_nowait(params, rid)
+        if err:
+            return err
     if (limit_message := _ensure_active_session_slot(sid, session)) is not None:
         return _err(rid, 4090, limit_message)
     # Which desktop window this message was typed into. Rewritten on every

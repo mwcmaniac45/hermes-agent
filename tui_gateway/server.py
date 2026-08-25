@@ -2539,6 +2539,77 @@ def _start_agent_build(sid: str, session: dict) -> None:
     build_thread.start()
 
 
+def _schedule_durable_prompt_projection(session: dict, work_id: str) -> None:
+    """Offer committed work to the future dispatcher without invoking legacy runtime.
+
+    Source choice is deliberately the session-owned profile ``state.db``: the
+    receipt/outbox belongs to that stored session, never the launch/global DB.
+    This bounded seam is intentionally a no-op until legacy runtime can safely
+    project durable v1 work.  Restart recovery reads ACCEPTED/QUEUED directly
+    from that same database, so a failure here cannot lose committed intent.
+    """
+    del session, work_id
+
+
+def _admit_durable_prompt_submission(rid, params: dict, session: dict, text: str,
+                                     display_kind: str | None) -> dict | None:
+    """Commit/read v1 receipt-work before any request-derived runtime mutation."""
+    durable_fields = ("submission_id", "contract_version", "semantic_fingerprint")
+    if not any(name in params for name in durable_fields):
+        return None
+    if not all(isinstance(params.get(name), str) and params[name] for name in durable_fields):
+        return _err(rid, 4004, "invalid durable prompt submission")
+    # Today's attachment and rewind paths need legacy in-memory/path state or
+    # a destructive locked DB rewrite.  Refuse before accepting rather than
+    # creating work legacy runtime cannot project safely.
+    if session.get("attached_images") or params.get("attachments"):
+        return _err(rid, 4092, "durable attachment replay requires reattach", data={"safe_action": "reattach_then_continue"})
+    if any(params.get(name) is not None for name in (
+        "truncate_before_user_ordinal", "truncate_before_row_id", "truncate_before_message_id",
+    )):
+        return _err(rid, 4092, "durable truncation is not available", data={"safe_action": "start_new_submission"})
+    if display_kind == "hidden":
+        return _err(rid, 4092, "durable hidden submission is not available", data={"safe_action": "start_new_submission"})
+    try:
+        # The session FK is an ownership prerequisite, not prompt projection.
+        # _ensure_session_db_row and _session_db share the profile-aware source.
+        _ensure_session_db_row(session)
+        with _session_db(session) as db:
+            if db is None:
+                return _err(rid, 5071, "session storage could not be opened")
+            admitted = db.create_or_read_prompt_submission(
+                session_id=str(session.get("session_key") or params.get("session_id") or ""),
+                submission_id=params["submission_id"],
+                contract_version=params["contract_version"],
+                semantic_fingerprint=params["semantic_fingerprint"],
+                payload={
+                    "text": text,
+                    "display_kind": "normal",
+                    "queued": bool(params.get("queued")),
+                    "interrupted": bool(params.get("interrupted")),
+                    "truncation_target": None,
+                    "truncation_consent": False,
+                    "attachments": [],
+                },
+            )
+    except Exception:
+        # Never expose persistence exceptions through a durable acknowledgement.
+        return _err(rid, 5071, "session storage could not be written")
+    if admitted["conflict"]:
+        return _err(rid, 4091, "durable submission conflict", data={
+            "submission_id": params["submission_id"], "field_class": "semantic_fingerprint",
+        })
+    if not admitted["created"]:
+        return _ok(rid, admitted["ack"])
+    try:
+        _schedule_durable_prompt_projection(session, admitted["work_id"])
+    except Exception:
+        # Commit is authoritative. Projection is best-effort and recoverable;
+        # never alter or leak into the safe receipt/replay surface.
+        logger.debug("durable prompt projection scheduling failed", exc_info=True)
+    return _ok(rid, admitted["ack"])
+
+
 def _sess_nowait(params, rid):
     s = _sessions.get(params.get("session_id") or "")
     return (s, None) if s else (None, _err(rid, 4001, "session not found"))
