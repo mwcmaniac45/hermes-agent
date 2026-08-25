@@ -13,18 +13,20 @@
 
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
+
 import { describe, expect, it } from 'vitest';
+
 import {
-  CONTRACT_VERSION,
+  type AttachmentIdentity,
   buildCanonicalSemanticObject,
   computeSemanticFingerprint,
   computeTextSha256,
+  CONTRACT_VERSION,
+  type PromptSubmissionAckV1,
   sortedJsonStringify,
   toSafeLogContext,
   validateAck,
   validateRequest,
-  type AttachmentIdentity,
-  type PromptSubmissionAckV1,
 } from './prompt-submission-contract';
 
 // ---------------------------------------------------------------------------
@@ -43,12 +45,15 @@ const fixture: Record<string, unknown> = JSON.parse(
 // Typed helpers for fixture access
 function getVectors(category: string): Array<Record<string, unknown>> {
   const tv = fixture['test_vectors'] as Record<string, unknown>;
+
   return tv[category] as Array<Record<string, unknown>>;
 }
 
 function findVector(category: string, id: string): Record<string, unknown> {
   const vec = getVectors(category).find((v) => v['id'] === id);
-  if (!vec) throw new Error(`Vector not found: ${category}/${id}`);
+
+  if (!vec) {throw new Error(`Vector not found: ${category}/${id}`);}
+
   return vec;
 }
 
@@ -58,11 +63,13 @@ function findVector(category: string, id: string): Record<string, unknown> {
 
 function fingerprintFromRaw(canonical: Record<string, unknown>): string {
   const rawAttachments = (canonical['attachments'] as Array<Record<string, unknown>>) ?? [];
+
   const attachments: AttachmentIdentity[] = rawAttachments.map((a) => ({
     order: a['order'] as number,
     identity: a['identity'] as string,
     version: a['version'] as string,
   }));
+
   const obj = buildCanonicalSemanticObject({
     text_sha256: canonical['text_sha256'] as string,
     display_kind: canonical['display_kind'] as string,
@@ -75,6 +82,7 @@ function fingerprintFromRaw(canonical: Record<string, unknown>): string {
     display_metadata: canonical['display_metadata'],
     replay_controls: (canonical['replay_controls'] as Record<string, unknown> | null) ?? null,
   });
+
   return computeSemanticFingerprint(obj);
 }
 
@@ -233,8 +241,9 @@ describe('TestCanonicalMismatch', () => {
 describe('TestValidAckVectors', () => {
   it('all valid_ack_vectors round-trip through validateAck', () => {
     const vectors = getVectors('valid_ack_vectors');
+
     for (const vec of vectors) {
-      if (!vec['expect_valid']) continue;
+      if (!vec['expect_valid']) {continue;}
       const ack = validateAck(vec['ack']);
       expect(ack.submission_id).toBe((vec['ack'] as Record<string, unknown>)['submission_id']);
     }
@@ -350,6 +359,7 @@ describe('TestSortedJsonStringify', () => {
       display_metadata: null,
       replay_controls: null,
     });
+
     const fp = computeSemanticFingerprint(objA);
     // Same canonical input must always produce the same hex digest
     expect(fp).toHaveLength(64);

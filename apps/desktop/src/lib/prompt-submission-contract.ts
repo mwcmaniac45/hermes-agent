@@ -126,16 +126,21 @@ export interface SafeLogContext {
  * Produces output identical to Python's json.dumps(sort_keys=True, separators=(',', ':'))
  */
 export function sortedJsonStringify(value: unknown): string {
-  if (value === null || value === undefined) return JSON.stringify(value);
-  if (typeof value !== 'object') return JSON.stringify(value);
+  if (value === null || value === undefined) {return JSON.stringify(value);}
+
+  if (typeof value !== 'object') {return JSON.stringify(value);}
+
   if (Array.isArray(value)) {
     return '[' + value.map(sortedJsonStringify).join(',') + ']';
   }
+
   const obj = value as Record<string, unknown>;
   const sortedKeys = Object.keys(obj).sort();
+
   const pairs = sortedKeys.map(
     (k) => JSON.stringify(k) + ':' + sortedJsonStringify(obj[k])
   );
+
   return '{' + pairs.join(',') + '}';
 }
 
@@ -189,11 +194,16 @@ export function buildCanonicalSemanticObject(params: {
 
   // Sort attachments by (order, identity, version) — stable, deterministic
   const sortedAttachments = [...attachments].sort((a, b) => {
-    if (a.order !== b.order) return a.order - b.order;
-    if (a.identity < b.identity) return -1;
-    if (a.identity > b.identity) return 1;
-    if (a.version < b.version) return -1;
-    if (a.version > b.version) return 1;
+    if (a.order !== b.order) {return a.order - b.order;}
+
+    if (a.identity < b.identity) {return -1;}
+
+    if (a.identity > b.identity) {return 1;}
+
+    if (a.version < b.version) {return -1;}
+
+    if (a.version > b.version) {return 1;}
+
     return 0;
   });
 
@@ -223,6 +233,7 @@ export function buildCanonicalSemanticObject(params: {
  */
 export function computeSemanticFingerprint(canonical: CanonicalSemanticObject): string {
   const serialized = sortedJsonStringify(canonical);
+
   return createHash('sha256').update(serialized, 'utf8').digest('hex');
 }
 
@@ -254,17 +265,22 @@ export function validateRequest(data: unknown): PromptSubmissionV1 {
   if (typeof data !== 'object' || data === null) {
     throw new Error('Request must be a non-null object');
   }
+
   const obj = data as Record<string, unknown>;
   const missing = REQUIRED_REQUEST_FIELDS.filter((f) => !(f in obj));
+
   if (missing.length > 0) {
     throw new Error(`Missing required request fields: ${missing.join(', ')}`);
   }
+
   const contractVersion = String(obj['contract_version']);
+
   if (contractVersion !== CONTRACT_VERSION) {
     throw new Error(
       `contract_version mismatch: expected ${CONTRACT_VERSION}, got ${contractVersion}`
     );
   }
+
   return {
     submission_id: String(obj['submission_id']),
     contract_version: CONTRACT_VERSION,
@@ -281,11 +297,14 @@ export function validateAck(data: unknown): PromptSubmissionAckV1 {
   if (typeof data !== 'object' || data === null) {
     throw new Error('Ack must be a non-null object');
   }
+
   const obj = data as Record<string, unknown>;
   const missing = REQUIRED_ACK_FIELDS.filter((f) => !(f in obj));
+
   if (missing.length > 0) {
     throw new Error(`Missing required ack fields: ${missing.join(', ')}`);
   }
+
   return {
     submission_id: String(obj['submission_id']),
     contract_version: String(obj['contract_version']),

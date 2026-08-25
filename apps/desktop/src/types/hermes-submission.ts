@@ -22,10 +22,10 @@ export type {
 } from '../lib/prompt-submission-contract';
 
 export {
-  CONTRACT_VERSION,
   buildCanonicalSemanticObject,
   computeSemanticFingerprint,
   computeTextSha256,
+  CONTRACT_VERSION,
   sortedJsonStringify,
   toSafeLogContext,
   validateAck,
