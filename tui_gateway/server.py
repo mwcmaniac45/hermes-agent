@@ -2563,6 +2563,64 @@ def _cleanup_durable_preinvocation_projection(session: dict, work_id: str, owner
                 session.pop("inflight_turn", None)
 
 
+def _durable_handoff_checkpoint(sid: str, session: dict, durable_context: dict[str, Any]) -> None:
+    """Test seam immediately before the durable owner-fenced handoff."""
+
+
+def _durable_nonprovider_preflight(sid: str, session: dict) -> None:
+    """Apply local turn configuration before the durable invocation boundary.
+
+    This deliberately contains no emit, marker, thread, or provider operation.
+    A failure is therefore safe to release from DISPATCHING back to ACCEPTED.
+    """
+    _apply_pending_model_switch(sid, session)
+    _sync_agent_model_with_config(sid, session)
+    _sync_bot_capabilities(sid, session)
+
+
+def _begin_durable_invocation(
+    sid: str, session: dict, durable_context: dict[str, Any], text: Any,
+) -> str:
+    """Linearize durable work at ``_sessions_lock -> history_lock -> DB``.
+
+    The caller performs refusal *after* this returns, never while either lock
+    is held.  No callbacks, agent construction, provider work, emits, joins,
+    or thread publication are permitted in this short fenced handoff.
+    """
+    del text  # Keep the boundary explicit without retaining prompt material.
+    work_id = durable_context["work_id"]
+    owner_token = durable_context["owner_token"]
+    with _sessions_lock:
+        with session["history_lock"]:
+            if (
+                _sessions.get(sid) is not session
+                or session.get("session_key") != sid
+                or durable_context.get("session_id") != sid
+                or session.get("_durable_projection_work_id") != work_id
+                or not session.get("running")
+                or session.get("_turn_cancel_requested")
+                or session.get("_closing")
+            ):
+                return "preinvocation"
+            attempt_token = str(uuid.uuid4())
+            try:
+                with _session_db(session) as durable_db:
+                    invoking = durable_db is not None and durable_db.mark_prompt_submission_invoking(
+                        work_id, owner_token=owner_token, attempt_token=attempt_token,
+                    )
+                    if invoking is None:
+                        return "preinvocation"
+                    durable_context["attempt_token"] = attempt_token
+                    running = durable_db.mark_prompt_submission_running(
+                        work_id, owner_token=owner_token, attempt_token=attempt_token,
+                    )
+            except Exception:
+                # A failed INVOKING write is still releasable; a RUNNING write
+                # failure has invocation intent and must settle safely.
+                return "running_failure" if durable_context.get("attempt_token") else "preinvocation"
+            return "running" if running else "running_failure"
+
+
 def _refuse_durable_preprovider_projection(
     sid: str,
     session: dict,
@@ -11027,60 +11085,60 @@ def _run_prompt_submit(
     queued_prompt_generation: int | None = None,
     durable_context: dict[str, Any] | None = None,
 ) -> bool:
-    with _sessions_lock:
-        current_session = _sessions.get(sid)
-    with session["history_lock"]:
-        if durable_context is not None and (
-            current_session is not session
-            or session.get("session_key") != sid
-            or durable_context.get("session_id") != sid
-            or session.get("_durable_projection_work_id") != durable_context.get("work_id")
-            or session.get("_turn_cancel_requested")
-            or not session.get("running")
-            or session.get("_closing")
-        ):
+    if durable_context is not None:
+        # Durable preflight is intentionally local-only. It happens before the
+        # owner-fenced handoff, so a failure can release DISPATCHING to ACCEPTED
+        # without creating visible/runtime turn state.
+        try:
+            _durable_nonprovider_preflight(sid, session)
+        except Exception:
             _refuse_durable_preprovider_projection(
                 sid, session, durable_context, started=False, invocation_started=False
             )
             return False
-        if session.get("_closing"):
-            if durable_context is not None:
-                _refuse_durable_preprovider_projection(
-                    sid, session, durable_context, started=False, invocation_started=False
-                )
-            else:
-                session["running"] = False
-            return False
-        if (
-            queued_prompt_generation is not None
-            and int(session.get("_queued_prompt_generation", 0)) != queued_prompt_generation
-        ):
-            if durable_context is not None:
-                _refuse_durable_preprovider_projection(
-                    sid, session, durable_context, started=False, invocation_started=False
-                )
-            else:
-                session["running"] = False
-            return False
-        if image_paths is None:
-            images = list(session.get("attached_images", []))
-            session["attached_images"] = []
-        else:
-            images = list(image_paths)
-        inflight = session.get("inflight_turn")
-        # A retained failed turn (see _fail_inflight_turn) is a stale leftover
-        # by the time a new turn starts — replace it, never append onto it.
-        if not isinstance(inflight, dict) or inflight.get("status") == "error":
-            _start_inflight_turn(
-                session, text,
-                durable_work_id=durable_context["work_id"] if durable_context is not None else None,
+        _durable_handoff_checkpoint(sid, session, durable_context)
+        handoff = _begin_durable_invocation(sid, session, durable_context, text)
+        if handoff != "running":
+            _refuse_durable_preprovider_projection(
+                sid, session, durable_context, started=False,
+                invocation_started=handoff == "running_failure",
             )
-        agent = session["agent"]
-        if hasattr(agent, "clear_interrupt"):
-            try:
-                agent.clear_interrupt()
-            except Exception:
-                pass
+            return False
+        # RUNNING is committed. Do not clear_interrupt here: an interruption
+        # arriving after the handoff is a normal running-turn interruption.
+        with session["history_lock"]:
+            inflight = session.get("inflight_turn")
+            if not isinstance(inflight, dict) or inflight.get("status") == "error":
+                _start_inflight_turn(session, text, durable_work_id=durable_context["work_id"])
+            agent = session["agent"]
+            images = [] if image_paths is None else list(image_paths)
+    else:
+        with session["history_lock"]:
+            if session.get("_closing"):
+                session["running"] = False
+                return False
+            if (
+                queued_prompt_generation is not None
+                and int(session.get("_queued_prompt_generation", 0)) != queued_prompt_generation
+            ):
+                session["running"] = False
+                return False
+            if image_paths is None:
+                images = list(session.get("attached_images", []))
+                session["attached_images"] = []
+            else:
+                images = list(image_paths)
+            inflight = session.get("inflight_turn")
+            # A retained failed turn (see _fail_inflight_turn) is a stale leftover
+            # by the time a new turn starts — replace it, never append onto it.
+            if not isinstance(inflight, dict) or inflight.get("status") == "error":
+                _start_inflight_turn(session, text)
+            agent = session["agent"]
+            if hasattr(agent, "clear_interrupt"):
+                try:
+                    agent.clear_interrupt()
+                except Exception:
+                    pass
     # Desktop/TUI observability (#86647): this is the ONE INFO record proving
     # a Desktop/TUI prompt was accepted by THIS process, and it ties together
     # every id a rotation-mute trace needs — the UI session id, the gateway
@@ -11166,17 +11224,18 @@ def _run_prompt_submit(
             # once-override back to the config model before the turn runs
             # (#29923 review defect). Any config.yaml change is adopted on
             # the NEXT turn, after the finally-restore below.
-            if not one_turn_restore:
-                # A model picked mid-turn was queued (not applied in-place) —
-                # apply it now, on the turn thread before the first model call,
-                # so this turn runs on the model the user chose. Runs before the
-                # config sync so an explicit pick wins over a config.yaml change.
-                _apply_pending_model_switch(sid, session)
-                _sync_agent_model_with_config(sid, session)
-            # Bot Chat capability sync — adopt Settings→Capabilities edits
-            # (skills/toolsets/MCP/SOUL) into the eternal bot session before
-            # the turn runs. No-op for every other session shape.
-            _sync_bot_capabilities(sid, session)
+            if durable_context is None:
+                if not one_turn_restore:
+                    # A model picked mid-turn was queued (not applied in-place) —
+                    # apply it now, on the turn thread before the first model call,
+                    # so this turn runs on the model the user chose. Runs before the
+                    # config sync so an explicit pick wins over a config.yaml change.
+                    _apply_pending_model_switch(sid, session)
+                    _sync_agent_model_with_config(sid, session)
+                # Bot Chat capability sync — adopt Settings→Capabilities edits
+                # (skills/toolsets/MCP/SOUL) into the eternal bot session before
+                # the turn runs. No-op for every other session shape.
+                _sync_bot_capabilities(sid, session)
             agent = session["agent"]
             # Snapshot after turn-start model sync. A deferred switch mutates
             # history and its version; that mutation belongs to this turn.
@@ -11397,40 +11456,8 @@ def _run_prompt_submit(
             lease_stop = None
             lease_thread = None
             if durable_context is not None:
-                attempt_token = str(uuid.uuid4())
-                try:
-                    with _session_db(session) as durable_db:
-                        invoking = durable_db is not None and durable_db.mark_prompt_submission_invoking(
-                            durable_context["work_id"], owner_token=durable_context["owner_token"],
-                            attempt_token=attempt_token,
-                        )
-                except Exception:
-                    _refuse_durable_preprovider_projection(
-                        sid, session, durable_context, started=True, invocation_started=False
-                    )
-                    return
-                if invoking is None:
-                    _refuse_durable_preprovider_projection(
-                        sid, session, durable_context, started=True, invocation_started=False
-                    )
-                    return
-                durable_context["attempt_token"] = attempt_token
-                try:
-                    with _session_db(session) as durable_db:
-                        running = durable_db is not None and durable_db.mark_prompt_submission_running(
-                            durable_context["work_id"], owner_token=durable_context["owner_token"],
-                            attempt_token=attempt_token,
-                        )
-                except Exception:
-                    _refuse_durable_preprovider_projection(
-                        sid, session, durable_context, started=True, invocation_started=True
-                    )
-                    return
-                if not running:
-                    _refuse_durable_preprovider_projection(
-                        sid, session, durable_context, started=True, invocation_started=True
-                    )
-                    return
+                # The owner-fenced INVOKING -> RUNNING handoff already completed
+                # synchronously before message.start and this thread publication.
                 lease_stop = threading.Event()
 
                 def _renew_durable_lease() -> None:
@@ -12102,7 +12129,7 @@ def _run_prompt_submit(
         registered = _sessions.get(sid)
         can_start = (
             not session.get("_closing")
-            and (registered is None or registered is session)
+            and (registered is session if durable_context is not None else registered is None or registered is session)
         )
         if can_start:
             session["_run_thread"] = run_thread
