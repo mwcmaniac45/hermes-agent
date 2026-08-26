@@ -12295,6 +12295,38 @@ def test_wait_agent_for_prompt_honors_cancel_mid_wait(monkeypatch):
         server._sessions.pop("sid", None)
 
 
+def test_wait_agent_for_prompt_honors_close_mid_wait(monkeypatch):
+    """A detached closing session must not keep a durable PREPARING lease alive."""
+    ready = threading.Event()  # never set
+    session = _session(agent_ready=ready)
+    session["agent"] = None
+    session["running"] = True
+    server._sessions["sid"] = session
+
+    try:
+        monkeypatch.setattr(server, "_AGENT_BUILD_WAIT_SLICE", 0.01)
+        monkeypatch.setattr(server, "_agent_build_wait_cap", lambda: 0.1)
+
+        def close_soon():
+            time.sleep(0.05)
+            with session["history_lock"]:
+                session["_closing"] = True
+            with server._sessions_lock:
+                server._sessions.pop("sid", None)
+
+        closer = threading.Thread(target=close_soon)
+        closer.start()
+        start = time.monotonic()
+        err = server._wait_agent_for_prompt(session, "rid-1", "sid")
+        elapsed = time.monotonic() - start
+        closer.join()
+
+        assert err is None
+        assert elapsed < 5.0, f"close honored only after {elapsed:.1f}s"
+    finally:
+        server._sessions.pop("sid", None)
+
+
 def test_agent_build_wait_cap_config_override(monkeypatch):
     """agent.build_wait_timeout in config.yaml overrides the default cap;
     invalid/absent values fall back to 600s."""

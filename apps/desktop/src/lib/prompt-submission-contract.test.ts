@@ -18,6 +18,7 @@ import { describe, expect, it } from 'vitest';
 
 import {
   type AttachmentIdentity,
+  buildPromptSubmissionV1,
   buildCanonicalSemanticObject,
   computeSemanticFingerprint,
   computeTextSha256,
@@ -386,5 +387,33 @@ describe('TestExecutionGuarantee', () => {
     expect(sha).toMatch(/^[0-9a-f]{64}$/);
     expect(sha).not.toBe(raw);
     expect(sha).not.toContain(raw);
+  });
+});
+
+describe('buildPromptSubmissionV1', () => {
+  it('binds one logical desktop submission to the canonical durable v1 fingerprint', () => {
+    const submission = buildPromptSubmissionV1({
+      submission_id: '550e8400-e29b-41d4-a716-446655440099',
+      text: 'durably submit this exact text',
+      queued: false,
+      interrupted: false,
+      surface: 'hud',
+    });
+
+    expect(submission).toEqual({
+      submission_id: '550e8400-e29b-41d4-a716-446655440099',
+      contract_version: CONTRACT_VERSION,
+      semantic_fingerprint: computeSemanticFingerprint(buildCanonicalSemanticObject({
+        text_sha256: computeTextSha256('durably submit this exact text'),
+        display_kind: 'normal',
+        queued: false,
+        interrupted: false,
+        surface: 'hud',
+        truncation_target: null,
+        truncation_consent: false,
+        attachments: [],
+        replay_controls: { attachments: 'unsupported', truncation: 'unsupported' },
+      })),
+    });
   });
 });

@@ -238,6 +238,33 @@ export function computeSemanticFingerprint(canonical: CanonicalSemanticObject): 
   return createHash('sha256').update(serialized, 'utf8').digest('hex');
 }
 
+/** Build the immutable durable-v1 identity reused for every transport retry. */
+export function buildPromptSubmissionV1(params: {
+  readonly submission_id: string;
+  readonly text: string;
+  readonly queued: boolean;
+  readonly interrupted: boolean;
+  readonly surface: string;
+}): PromptSubmissionV1 {
+  const canonical = buildCanonicalSemanticObject({
+    text_sha256: computeTextSha256(params.text),
+    display_kind: 'normal',
+    queued: params.queued,
+    interrupted: params.interrupted,
+    surface: params.surface,
+    truncation_target: null,
+    truncation_consent: false,
+    attachments: [],
+    replay_controls: { attachments: 'unsupported', truncation: 'unsupported' },
+  });
+
+  return {
+    submission_id: params.submission_id,
+    contract_version: CONTRACT_VERSION,
+    semantic_fingerprint: computeSemanticFingerprint(canonical),
+  };
+}
+
 // ---------------------------------------------------------------------------
 // Validation helpers
 // ---------------------------------------------------------------------------

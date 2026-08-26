@@ -1160,6 +1160,60 @@ def test_post_running_stateful_sync_failure_terminalizes_before_provider(
     assert [event[0] for event in emitted].count("message.complete") == 1
 
 
+def test_blocked_durable_context_reference_terminalizes_without_leaking_warning(
+    monkeypatch, tmp_path,
+):
+    """A rejected @ reference is known pre-provider work, never UNKNOWN_OUTCOME."""
+    profile = tmp_path / "profile"
+    profile.mkdir()
+    db = SessionDB(db_path=profile / "state.db")
+    db.create_session("session-a", "tui")
+    work = _work(db, text="@private-reference")
+    db.close()
+    session = _session(profile)
+    emitted, provider_entries = [], []
+
+    class InlineThread:
+        def __init__(self, *, target, daemon): self.target = target
+        def start(self): self.target()
+        def join(self, *_a, **_k): return None
+
+    class Agent:
+        session_id = "session-a"
+        provider = "test"
+        model = "test"
+        interim_assistant_callback = None
+        def run_conversation(self, *_a, **_k): provider_entries.append(True)
+
+    class BlockedContext:
+        blocked = True
+        warnings = ["secret path /private/credential"]
+
+    session["agent"] = Agent()
+    monkeypatch.setattr(server.threading, "Thread", InlineThread)
+    monkeypatch.setattr(server, "_start_agent_build", lambda *_a: None)
+    monkeypatch.setattr(server, "_wait_agent_for_prompt", lambda *_a: None)
+    monkeypatch.setattr(server, "_emit", lambda *args: emitted.append(args))
+    monkeypatch.setattr(
+        "agent.context_references.preprocess_context_references",
+        lambda *_a, **_k: BlockedContext(),
+    )
+
+    server._schedule_durable_prompt_projection(session, work["work_id"])
+
+    check = SessionDB(db_path=profile / "state.db")
+    try:
+        replay = check.create_or_read_prompt_submission(
+            session_id="session-a", submission_id="submission-a", contract_version="1",
+            semantic_fingerprint="a" * 64, payload={"text": "@private-reference"},
+        )
+        assert replay["ack"]["invocation_status"] == "terminal_error"
+    finally:
+        check.close()
+    assert provider_entries == []
+    assert "secret path /private/credential" not in repr(emitted)
+
+
 def test_durable_handoff_wins_when_interrupt_is_waiting_on_history_lock(tmp_path):
     """An interrupt queued behind history_lock observes an already RUNNING turn."""
     profile = tmp_path / "profile"

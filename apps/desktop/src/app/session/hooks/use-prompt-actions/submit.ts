@@ -6,6 +6,7 @@ import { type ChatMessage, textPart } from '@/lib/chat-messages'
 import { optimisticAttachmentRef } from '@/lib/chat-runtime'
 import { sanitizeComposerInput } from '@/lib/composer-input-sanitize'
 import { setMutableRef } from '@/lib/mutable-ref'
+import { buildPromptSubmissionV1, validateAck } from '@/lib/prompt-submission-contract'
 import {
   isVoicePlaybackActive,
   markVoicePlaybackInterrupted,
@@ -690,10 +691,20 @@ export function useSubmitPrompt(deps: SubmitPromptDeps) {
         attachmentRefs = syncedAttachments.map(optimisticAttachmentRef).filter((r): r is string => Boolean(r))
         rewriteOptimistic(liveSessionId)
         const text = buildContextText(syncedAttachments)
+        // One logical send owns one opaque durable identity. Keep it outside
+        // submitParams so session-resume and busy retries cannot mint a new row.
+        const durableSubmission = buildPromptSubmissionV1({
+          submission_id: crypto.randomUUID(),
+          text,
+          queued: options?.fromQueue === true,
+          interrupted,
+          surface: $hudMode.get() ? 'hud' : ''
+        })
 
         const submitParams = (targetId: string) => ({
           session_id: targetId,
           text,
+          ...durableSubmission,
           ...(interrupted && { interrupted }),
           // Off-screen widget intent: the gateway types the persisted user
           // row display_kind=hidden so no client renders it as a bubble.
@@ -720,7 +731,7 @@ export function useSubmitPrompt(deps: SubmitPromptDeps) {
         try {
           const recoverStoredSessionId = targetStoredSessionId ?? selectedStoredSessionIdRef.current
 
-          await withSessionNotFoundResume(
+          const durableResult = await withSessionNotFoundResume(
             sessionId,
             recoverStoredSessionId,
             liveId =>
@@ -742,6 +753,7 @@ export function useSubmitPrompt(deps: SubmitPromptDeps) {
             // instead of erroring out and losing the session binding.
             { alsoTimeout: true }
           )
+          validateAck(durableResult.result)
         } catch (firstErr) {
           if (firstErr instanceof SessionRecoveryAborted) {
             console.warn('[submit-drift-abort]', firstErr.reason, { phase: 'post-resume-retry' })

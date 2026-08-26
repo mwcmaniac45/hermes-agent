@@ -115,8 +115,9 @@ class SessionSubmissionMixin:
     """SessionDB-owned receipt/work state machine; never uses state_meta."""
 
     @staticmethod
-    def _submission_ack(submission_id: str, state: str) -> dict[str, Any]:
+    def _submission_ack(submission_id: str, semantic_fingerprint: str, state: str) -> dict[str, Any]:
         return {"submission_id": submission_id, "contract_version": "1",
+                "semantic_fingerprint": semantic_fingerprint,
                 "durable_admission_status": "accepted", "invocation_status": state.lower(),
                 "safe_terminal_action": _SAFE_ACTION.get(state)}
 
@@ -135,7 +136,7 @@ class SessionSubmissionMixin:
         if row["semantic_fingerprint"] != semantic_fingerprint:
             return {"conflict": True}
         return {"conflict": False, "work_id": row["work_id"],
-                "ack": self._submission_ack(submission_id, row["state"])}
+                "ack": self._submission_ack(submission_id, semantic_fingerprint, row["state"])}
 
     def create_or_read_prompt_submission(self, *, session_id: str, submission_id: str,
                                          contract_version: str, semantic_fingerprint: str,
@@ -151,8 +152,8 @@ class SessionSubmissionMixin:
                 if row[0] != semantic_fingerprint:
                     return {"created": False, "conflict": True, "code": 4091}
                 state = conn.execute("SELECT state FROM prompt_accepted_work WHERE work_id=?", (row[1],)).fetchone()[0]
-                return {"created": False, "conflict": False, "work_id": row[1], "ack": self._submission_ack(submission_id, state)}
-            work_id, ack = str(uuid.uuid4()), self._submission_ack(submission_id, "ACCEPTED")
+                return {"created": False, "conflict": False, "work_id": row[1], "ack": self._submission_ack(submission_id, semantic_fingerprint, state)}
+            work_id, ack = str(uuid.uuid4()), self._submission_ack(submission_id, semantic_fingerprint, "ACCEPTED")
             conn.execute("INSERT INTO prompt_submission_receipts (session_id, submission_id, contract_version, semantic_fingerprint, work_id, safe_ack_json, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)", (session_id, submission_id, contract_version, semantic_fingerprint, work_id, json.dumps(ack, sort_keys=True), now, now))
             conn.execute("INSERT INTO prompt_accepted_work (work_id, session_id, submission_id, payload_json, state, owner_generation, invocation_attempt_no, created_at, updated_at) VALUES (?, ?, ?, ?, 'ACCEPTED', 0, 0, ?, ?)", (work_id, session_id, submission_id, payload_wire, now, now))
             # Test-only deterministic crash/race checkpoint; transaction remains real.

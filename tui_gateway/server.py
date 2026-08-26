@@ -2246,11 +2246,28 @@ def _wait_agent_for_prompt(session: dict, rid: str, sid: str) -> dict | None:
     start = time.monotonic()
     cap = _agent_build_wait_cap()
     notified_slow = False
-    while not ready.wait(timeout=_AGENT_BUILD_WAIT_SLICE):
+
+    def _wait_cancelled_or_detached() -> bool:
+        """Stop a deferred turn once its owning session is no longer usable."""
+        with _sessions_lock:
+            registered = _sessions.get(sid)
         with session["history_lock"]:
-            cancelled = session.get("_turn_cancel_requested") or not session.get(
-                "running"
+            return bool(
+                session.get("_turn_cancel_requested")
+                or session.get("_closing")
+                or not session.get("running")
+                or (registered is not None and registered is not session)
             )
+
+    while True:
+        if _wait_cancelled_or_detached():
+            return None
+        if ready.wait(timeout=_AGENT_BUILD_WAIT_SLICE):
+            break
+        with session["history_lock"]:
+            cancelled = session.get("_turn_cancel_requested") or session.get(
+                "_closing"
+            ) or not session.get("running")
         if cancelled:
             # The caller's cancel/not-running branch emits the user-visible
             # event for this — bail without an error of our own.
@@ -2299,6 +2316,8 @@ def _wait_agent_for_prompt(session: dict, rid: str, sid: str) -> dict | None:
                     "id": _AGENT_BUILD_SLOW_NOTICE_KEY,
                 },
             )
+    if _wait_cancelled_or_detached():
+        return None
     if notified_slow:
         _emit("notification.clear", sid, {"key": _AGENT_BUILD_SLOW_NOTICE_KEY})
     err = session.get("agent_error")
@@ -11423,6 +11442,19 @@ def _run_prompt_submit(
                     context_length=ctx_len,
                 )
                 if ctx.blocked:
+                    if durable_context is not None and durable_context.get("attempt_token"):
+                        # The durable row is already RUNNING, but a blocked
+                        # reference is still proven pre-provider work. Never
+                        # surface resolver diagnostics or leave false ambiguity.
+                        _emit_durable_safe_failure(
+                            sid,
+                            session,
+                            durable_context,
+                            marker_key,
+                            state="TERMINAL_ERROR",
+                            failure_code="local_runtime_failed",
+                        )
+                        return
                     _emit(
                         "error",
                         sid,

@@ -42,6 +42,25 @@ def test_prompt_submission_requires_existing_profile_local_session_and_fk_is_cle
         other.close()
 
 
+def test_durable_receipt_ack_includes_stored_semantic_fingerprint_on_create_and_replay(tmp_path):
+    """The versioned acknowledgement binds both create and replay to its fingerprint."""
+    db = _db_with_session(tmp_path / "state.db")
+    fingerprint = "a" * 64
+    try:
+        created = db.create_or_read_prompt_submission(
+            session_id="stored-session", submission_id="fingerprinted", contract_version="1",
+            semantic_fingerprint=fingerprint, payload={"text": "allowed"},
+        )
+        replayed = db.create_or_read_prompt_submission(
+            session_id="stored-session", submission_id="fingerprinted", contract_version="1",
+            semantic_fingerprint=fingerprint, payload={"text": "allowed"},
+        )
+        assert created["ack"]["semantic_fingerprint"] == fingerprint
+        assert replayed["ack"]["semantic_fingerprint"] == fingerprint
+    finally:
+        db.close()
+
+
 def test_recovery_reattaches_proven_unexpired_live_owner_and_completion_survives(tmp_path):
     """Recovery preserves only the exact, leased invocation owner witness."""
     db = _db_with_session(tmp_path / "state.db")
