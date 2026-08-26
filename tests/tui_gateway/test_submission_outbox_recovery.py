@@ -297,7 +297,7 @@ def test_legacy_outbox_schema_migrates_to_session_owned_foreign_keys(tmp_path):
         CREATE TABLE prompt_submission_receipts (session_id TEXT NOT NULL, submission_id TEXT NOT NULL, contract_version TEXT NOT NULL, semantic_fingerprint TEXT NOT NULL, work_id TEXT NOT NULL UNIQUE, safe_ack_json TEXT NOT NULL, created_at REAL NOT NULL, updated_at REAL NOT NULL, PRIMARY KEY (session_id, submission_id));
         CREATE TABLE prompt_accepted_work (work_id TEXT PRIMARY KEY, session_id TEXT NOT NULL, submission_id TEXT NOT NULL, payload_json TEXT NOT NULL, state TEXT NOT NULL, owner_token TEXT, owner_generation INTEGER NOT NULL DEFAULT 0, lease_expires_at REAL, invocation_attempt_token TEXT, invocation_attempt_no INTEGER NOT NULL DEFAULT 0, safe_terminal_json TEXT, created_at REAL NOT NULL, updated_at REAL NOT NULL, UNIQUE (session_id, submission_id), FOREIGN KEY (session_id, submission_id) REFERENCES prompt_submission_receipts(session_id, submission_id));
         INSERT INTO prompt_submission_receipts SELECT * FROM receipt_old;
-        INSERT INTO prompt_accepted_work SELECT * FROM work_old;
+        INSERT INTO prompt_accepted_work (work_id, session_id, submission_id, payload_json, state, owner_token, owner_generation, lease_expires_at, invocation_attempt_token, invocation_attempt_no, safe_terminal_json, created_at, updated_at) SELECT work_id, session_id, submission_id, payload_json, state, owner_token, owner_generation, lease_expires_at, invocation_attempt_token, invocation_attempt_no, safe_terminal_json, created_at, updated_at FROM work_old;
         DROP TABLE work_old;
         DROP TABLE receipt_old;
     """)

@@ -201,7 +201,46 @@ class SessionSubmissionMixin:
             (time.time(), work_id, owner_token),
         ).rowcount == 1)
 
+    def mark_prompt_submission_preparing(self, work_id: str, *, owner_token: str,
+                                         prepare_token: str, lease_seconds: float = 30) -> dict[str, Any] | None:
+        """Fence runtime-only preparation before any provider boundary."""
+        now = time.time()
+        changed = self._execute_write(lambda conn: conn.execute(
+            "UPDATE prompt_accepted_work SET state='PREPARING', runtime_prepare_token=?, "
+            "lease_expires_at=?, updated_at=? WHERE work_id=? AND owner_token=? "
+            "AND state='DISPATCHING' AND invocation_attempt_token IS NULL",
+            (prepare_token, now + lease_seconds, now, work_id, owner_token),
+        ).rowcount)
+        return {"state": "PREPARING", "runtime_prepare_token": prepare_token} if changed == 1 else None
+
+    def mark_prompt_submission_invoking_from_preparing(self, work_id: str, *, owner_token: str,
+                                                       prepare_token: str, attempt_token: str,
+                                                       lease_seconds: float = 30) -> dict[str, Any] | None:
+        """Record provider intent only after exact runtime preparation succeeds."""
+        now = time.time()
+        changed = self._execute_write(lambda conn: conn.execute(
+            "UPDATE prompt_accepted_work SET state='INVOKING', invocation_attempt_token=?, "
+            "invocation_attempt_no=invocation_attempt_no+1, lease_expires_at=?, updated_at=? "
+            "WHERE work_id=? AND owner_token=? AND runtime_prepare_token=? AND state='PREPARING'",
+            (attempt_token, now + lease_seconds, now, work_id, owner_token, prepare_token),
+        ).rowcount)
+        return {"state": "INVOKING", "invocation_attempt_token": attempt_token} if changed == 1 else None
+
+    def complete_prompt_submission_preparing(self, work_id: str, *, owner_token: str,
+                                             prepare_token: str, state: str,
+                                             safe_terminal: dict[str, Any] | None = None) -> bool:
+        """Terminalize an exact pre-provider owner; never release committed setup."""
+        if state not in _TERMINAL: raise ValueError("invalid durable terminal state")
+        summary = _safe_terminal_summary(safe_terminal)
+        return self._execute_write(lambda conn: conn.execute(
+            "UPDATE prompt_accepted_work SET state=?, safe_terminal_json=?, owner_token=NULL, "
+            "lease_expires_at=NULL, updated_at=? WHERE work_id=? AND owner_token=? "
+            "AND runtime_prepare_token=? AND state='PREPARING'",
+            (state, json.dumps(summary, sort_keys=True), time.time(), work_id, owner_token, prepare_token),
+        ).rowcount == 1)
+
     def mark_prompt_submission_invoking(self, work_id: str, *, owner_token: str, attempt_token: str, lease_seconds: float = 30) -> dict[str, Any] | None:
+        """Compatibility handoff for callers that have not entered PREPARING."""
         now = time.time()
         def write(conn):
             changed = conn.execute("UPDATE prompt_accepted_work SET state='INVOKING', invocation_attempt_token=?, invocation_attempt_no=invocation_attempt_no+1, lease_expires_at=?, updated_at=? WHERE work_id=? AND owner_token=? AND state='DISPATCHING'", (attempt_token, now + lease_seconds, now, work_id, owner_token)).rowcount
@@ -238,20 +277,23 @@ class SessionSubmissionMixin:
                                        live_owner_witnesses: list[dict[str, Any]] | None = None) -> list[dict[str, Any]]:
         """Recover a single session's work; invocation intent never auto-replays."""
         now = time.time() if now is None else now
-        witnesses = set()
+        invocation_witnesses = set()
+        preparing_witnesses = set()
         for witness in live_owner_witnesses or []:
-            if not isinstance(witness, dict) or set(witness) != {
-                "work_id", "owner_generation", "owner_token", "invocation_attempt_token"
-            }:
+            if not isinstance(witness, dict) or not {"work_id", "owner_generation", "owner_token"} <= set(witness):
                 raise ValueError("invalid recovered live-owner witness")
-            work_id = witness["work_id"]
-            generation = witness["owner_generation"]
-            owner_token = witness["owner_token"]
-            attempt_token = witness["invocation_attempt_token"]
+            work_id, generation, owner_token = witness["work_id"], witness["owner_generation"], witness["owner_token"]
+            token_keys = set(witness) - {"work_id", "owner_generation", "owner_token"}
+            if token_keys == {"invocation_attempt_token"}:
+                token, target = witness["invocation_attempt_token"], invocation_witnesses
+            elif token_keys == {"runtime_prepare_token"}:
+                token, target = witness["runtime_prepare_token"], preparing_witnesses
+            else:
+                raise ValueError("invalid recovered live-owner witness")
             if (not isinstance(work_id, str) or type(generation) is not int
-                    or not isinstance(owner_token, str) or not isinstance(attempt_token, str)):
+                    or not isinstance(owner_token, str) or not isinstance(token, str)):
                 raise ValueError("invalid recovered live-owner witness")
-            witnesses.add((work_id, generation, owner_token, attempt_token))
+            target.add((work_id, generation, owner_token, token))
 
         def write(conn):
             scope = ""
@@ -267,7 +309,7 @@ class SessionSubmissionMixin:
             unknown_ids = [
                 row["work_id"] for row in invoking
                 if row["lease_expires_at"] is None or row["lease_expires_at"] <= now
-                or (row["work_id"], row["owner_generation"], row["owner_token"], row["invocation_attempt_token"]) not in witnesses
+                or (row["work_id"], row["owner_generation"], row["owner_token"], row["invocation_attempt_token"]) not in invocation_witnesses
             ]
             if unknown_ids:
                 placeholders = ",".join("?" for _ in unknown_ids)
@@ -276,6 +318,22 @@ class SessionSubmissionMixin:
                     f"lease_expires_at=NULL, safe_terminal_json=?, updated_at=? "
                     f"WHERE work_id IN ({placeholders}) AND state IN ('INVOKING','RUNNING')",
                     (json.dumps({"code": "unknown_outcome", "safe_action": _SAFE_ACTION["UNKNOWN_OUTCOME"]}, sort_keys=True), now, *unknown_ids),
+                )
+            preparing = conn.execute(
+                "SELECT work_id, owner_generation, owner_token, runtime_prepare_token, lease_expires_at "
+                "FROM prompt_accepted_work WHERE state='PREPARING'" + scope, scope_values,
+            ).fetchall()
+            recover_preparing_ids = [
+                row["work_id"] for row in preparing
+                if row["lease_expires_at"] is None or row["lease_expires_at"] <= now
+                or (row["work_id"], row["owner_generation"], row["owner_token"], row["runtime_prepare_token"]) not in preparing_witnesses
+            ]
+            if recover_preparing_ids:
+                placeholders = ",".join("?" for _ in recover_preparing_ids)
+                conn.execute(
+                    f"UPDATE prompt_accepted_work SET state='ACCEPTED', owner_token=NULL, lease_expires_at=NULL, updated_at=? "
+                    f"WHERE work_id IN ({placeholders}) AND state='PREPARING'",
+                    (now, *recover_preparing_ids),
                 )
             conn.execute(
                 "UPDATE prompt_accepted_work SET state='ACCEPTED', owner_token=NULL, "

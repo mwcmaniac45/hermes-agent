@@ -2577,15 +2577,36 @@ def _durable_nonprovider_preflight(sid: str, session: dict) -> None:
     del sid, session
 
 
+def _begin_durable_preparation(sid: str, session: dict, durable_context: dict[str, Any]) -> bool:
+    """First runtime-side action: fence setup before changing live projection."""
+    work_id, owner_token = durable_context["work_id"], durable_context["owner_token"]
+    prepare_token = str(uuid.uuid4())
+    with _sessions_lock:
+        with session["history_lock"]:
+            if (_sessions.get(sid) is not session or session.get("session_key") != sid
+                    or durable_context.get("session_id") != sid or session.get("running")
+                    or session.get("_turn_cancel_requested") or session.get("_closing")):
+                return False
+            try:
+                with _session_db(session) as db:
+                    prepared = db is not None and db.mark_prompt_submission_preparing(
+                        work_id, owner_token=owner_token, prepare_token=prepare_token,
+                    )
+            except Exception:
+                return False
+            if prepared is None:
+                return False
+            durable_context["prepare_token"] = prepare_token
+            session["running"] = True
+            session["_durable_projection_work_id"] = work_id
+            session["last_active"] = time.time()
+            return True
+
+
 def _begin_durable_invocation(
     sid: str, session: dict, durable_context: dict[str, Any], text: Any,
 ) -> str:
-    """Linearize durable work at ``_sessions_lock -> history_lock -> DB``.
-
-    The caller performs refusal *after* this returns, never while either lock
-    is held.  No callbacks, agent construction, provider work, emits, joins,
-    or thread publication are permitted in this short fenced handoff.
-    """
+    """Promote exact PREPARING owner to provider intent under full lock order."""
     del text  # Keep the boundary explicit without retaining prompt material.
     work_id = durable_context["work_id"]
     owner_token = durable_context["owner_token"]
@@ -2604,9 +2625,17 @@ def _begin_durable_invocation(
             attempt_token = str(uuid.uuid4())
             try:
                 with _session_db(session) as durable_db:
-                    invoking = durable_db is not None and durable_db.mark_prompt_submission_invoking(
-                        work_id, owner_token=owner_token, attempt_token=attempt_token,
-                    )
+                    if durable_context.get("prepare_token"):
+                        invoking = durable_db is not None and durable_db.mark_prompt_submission_invoking_from_preparing(
+                            work_id, owner_token=owner_token, prepare_token=durable_context["prepare_token"],
+                            attempt_token=attempt_token,
+                        )
+                    else:
+                        # Compatibility for direct legacy callers; scheduler v1
+                        # always supplies a preparation fence.
+                        invoking = durable_db is not None and durable_db.mark_prompt_submission_invoking(
+                            work_id, owner_token=owner_token, attempt_token=attempt_token,
+                        )
                     if invoking is None:
                         return "preinvocation"
                     durable_context["attempt_token"] = attempt_token
@@ -2641,6 +2670,14 @@ def _refuse_durable_preprovider_projection(
                 inflight = session.get("inflight_turn")
                 if isinstance(inflight, dict) and inflight.get("durable_work_id") == durable_context["work_id"]:
                     session.pop("inflight_turn", None)
+    elif durable_context.get("prepare_token"):
+        _settle_durable_terminal(
+            session, durable_context, state="TERMINAL_ERROR", failure_code="local_runtime_failed",
+        )
+        with session["history_lock"]:
+            if session.get("_durable_projection_work_id") == durable_context["work_id"]:
+                session.pop("_durable_projection_work_id", None)
+                session["running"] = False
     else:
         _cleanup_durable_preinvocation_projection(
             session, durable_context["work_id"], durable_context["owner_token"]
@@ -2664,11 +2701,21 @@ def _settle_durable_terminal(
     }
     try:
         with _session_db(session) as db:
-            return db is not None and db.complete_prompt_submission_work(
-                durable_context["work_id"], owner_token=durable_context["owner_token"],
-                attempt_token=durable_context["attempt_token"], state=state,
-                safe_terminal=safe_terminal,
-            )
+            if db is None:
+                return False
+            if durable_context.get("attempt_token"):
+                return db.complete_prompt_submission_work(
+                    durable_context["work_id"], owner_token=durable_context["owner_token"],
+                    attempt_token=durable_context["attempt_token"], state=state,
+                    safe_terminal=safe_terminal,
+                )
+            if durable_context.get("prepare_token"):
+                return db.complete_prompt_submission_preparing(
+                    durable_context["work_id"], owner_token=durable_context["owner_token"],
+                    prepare_token=durable_context["prepare_token"], state=state,
+                    safe_terminal=safe_terminal,
+                )
+            return False
     except Exception:
         return False
 
@@ -2730,27 +2777,36 @@ def _schedule_durable_prompt_projection(session: dict, work_id: str) -> None:
                 or not isinstance(payload.get("text"), str)
             ):
                 _refuse_durable_preprovider_projection(
-                    sid, session, durable_context, started=False, invocation_started=False
+                    sid, session, durable_context,
+                    started=bool(durable_context.get("_message_started")), invocation_started=False
                 )
                 return
-            with session["history_lock"]:
-                initial_refusal = (
-                    session.get("running") or session.get("_closing")
-                    or session.get("session_key") != sid
-                )
-                if not initial_refusal:
-                    session["running"] = True
-                    session["_durable_projection_work_id"] = work_id
-                    session["last_active"] = time.time()
-            if initial_refusal:
+            try:
+                _durable_nonprovider_preflight(sid, session)
+            except Exception:
                 _refuse_durable_preprovider_projection(
-                    sid, session, durable_context, started=False, invocation_started=False
+                    sid, session, durable_context,
+                    started=bool(durable_context.get("_message_started")), invocation_started=False
                 )
                 return
+            # Last side-effect-free test/validation seam before the preparation
+            # handoff. A cancellation here returns the DISPATCHING claim intact.
+            _durable_handoff_checkpoint(sid, session, durable_context)
+            if not _begin_durable_preparation(sid, session, durable_context):
+                _refuse_durable_preprovider_projection(
+                    sid, session, durable_context,
+                    started=bool(durable_context.get("_message_started")), invocation_started=False
+                )
+                return
+            # PREPARING is committed: runtime construction may now have effects,
+            # but no provider intent exists until the later promotion.
+            _emit("message.start", sid)
+            durable_context["_message_started"] = True
             _start_agent_build(sid, session)
             if _wait_agent_for_prompt(session, f"__durable__{work_id}", sid) is not None:
-                _refuse_durable_preprovider_projection(
-                    sid, session, durable_context, started=False, invocation_started=False
+                _emit_durable_safe_failure(
+                    sid, session, durable_context, "", state="TERMINAL_ERROR",
+                    failure_code="local_runtime_failed",
                 )
                 return
             with _sessions_lock:
@@ -2767,7 +2823,14 @@ def _schedule_durable_prompt_projection(session: dict, work_id: str) -> None:
                 )
             if durable_dispatch_cancelled:
                 _refuse_durable_preprovider_projection(
-                    sid, session, durable_context, started=False, invocation_started=False
+                    sid, session, durable_context,
+                    started=bool(durable_context.get("_message_started")), invocation_started=False
+                )
+                return
+            if not _run_durable_stateful_sync(sid, session):
+                _emit_durable_safe_failure(
+                    sid, session, durable_context, "", state="TERMINAL_ERROR",
+                    failure_code="local_runtime_failed",
                 )
                 return
             if not _run_prompt_submit(
@@ -2775,12 +2838,14 @@ def _schedule_durable_prompt_projection(session: dict, work_id: str) -> None:
                 durable_context=durable_context,
             ):
                 _refuse_durable_preprovider_projection(
-                    sid, session, durable_context, started=False, invocation_started=False
+                    sid, session, durable_context,
+                    started=bool(durable_context.get("_message_started")), invocation_started=False
                 )
         except Exception:
             if durable_context is not None:
                 _refuse_durable_preprovider_projection(
-                    sid, session, durable_context, started=False, invocation_started=False
+                    sid, session, durable_context,
+                    started=bool(durable_context.get("_message_started")), invocation_started=False
                 )
             return
 
@@ -5504,7 +5569,7 @@ def _apply_model_switch(
     }
 
 
-def _sync_bot_capabilities(sid: str, session: dict) -> None:
+def _sync_bot_capabilities(sid: str, session: dict, *, strict_durable: bool = False) -> bool:
     """Rebuild a Bot Chat session's agent when its capability surface changed.
 
     Bot Chats are eternal sessions; toolsets/MCP tool definitions are baked
@@ -5538,7 +5603,7 @@ def _sync_bot_capabilities(sid: str, session: dict) -> None:
         if seen is None or seen == current:
             return
     except Exception:
-        return
+        return False if strict_durable else None
 
     # Capability surface changed — rebuild the agent in place. Same
     # session_id/key, so the DB-backed history and (epoch-refreshed) system
@@ -5563,25 +5628,28 @@ def _sync_bot_capabilities(sid: str, session: dict) -> None:
             {"message": "Capabilities updated — this bot's tools and prompt were refreshed."},
         )
     except Exception as e:
+        if strict_durable:
+            return False
         logger.warning("Bot capability sync failed for %s: %s", sid, e)
+    return True
 
 
-def _sync_agent_model_with_config(sid: str, session: dict) -> None:
+def _sync_agent_model_with_config(sid: str, session: dict, *, strict_durable: bool = False) -> bool:
     """Adopt a config.yaml model change at turn start, like gateways do per
     message. Sessions pinned with /model keep their choice; a failed switch
     keeps the current model and never blocks the turn.
     """
     agent = session.get("agent")
     if agent is None or session.get("model_override"):
-        return
+        return True
     target = _config_model_target()
     if not target[0]:
-        return
+        return True
     seen = session.get("config_model_seen")
     # Record first so a broken config gets one attempt per edit, not per turn.
     session["config_model_seen"] = target
     if target == seen:
-        return
+        return True
     model, provider = target
     # Already running the configured model (branched/resumed session before
     # its first sync, or a config revert after a failed switch): adopt the
@@ -5589,7 +5657,7 @@ def _sync_agent_model_with_config(sid: str, session: dict) -> None:
     if model == getattr(agent, "model", "") and (
         not provider or provider == getattr(agent, "provider", "")
     ):
-        return
+        return True
     raw = f"{model} --provider {provider}" if provider else model
     try:
         _apply_model_switch(
@@ -5606,14 +5674,17 @@ def _sync_agent_model_with_config(sid: str, session: dict) -> None:
             persist_override=False,
         )
     except Exception as e:
+        if strict_durable:
+            return False
         _emit(
             "error",
             sid,
             {"message": f"Could not switch to configured model {model}: {e}"},
         )
+    return True
 
 
-def _apply_pending_model_switch(sid: str, session: dict) -> None:
+def _apply_pending_model_switch(sid: str, session: dict, *, strict_durable: bool = False) -> bool:
     """Apply a model switch queued while a turn was running.
 
     ``config.set model`` on a busy session doesn't mutate the live agent (the
@@ -5626,7 +5697,7 @@ def _apply_pending_model_switch(sid: str, session: dict) -> None:
     """
     pending = session.pop("pending_model_switch", None)
     if not pending or session.get("agent") is None:
-        return
+        return True
     try:
         result = _apply_model_switch(
             sid,
@@ -5644,11 +5715,34 @@ def _apply_pending_model_switch(sid: str, session: dict) -> None:
                 {"message": result.get("confirm_message") or result.get("warning") or ""},
             )
     except Exception as e:
+        if strict_durable:
+            return False
         _emit(
             "error",
             sid,
             {"message": f"Could not switch model: {e}"},
         )
+    return True
+
+
+def _run_durable_stateful_sync(sid: str, session: dict) -> bool:
+    """Durable-only silent setup gate; failure must block provider entry."""
+    def strict_call(fn):
+        # Existing test seams and third-party hooks may retain the old two-arg
+        # signature; real helpers receive the strict durable contract.
+        try:
+            accepts_strict = "strict_durable" in inspect.signature(fn).parameters
+        except (TypeError, ValueError):
+            accepts_strict = False
+        return fn(sid, session, strict_durable=True) if accepts_strict else fn(sid, session)
+    try:
+        return all(result is not False for result in (
+            strict_call(_apply_pending_model_switch),
+            strict_call(_sync_agent_model_with_config),
+            strict_call(_sync_bot_capabilities),
+        ))
+    except Exception:
+        return False
 
 
 class CompressionLockHeld(Exception):
@@ -11108,17 +11202,7 @@ def _run_prompt_submit(
     durable_context: dict[str, Any] | None = None,
 ) -> bool:
     if durable_context is not None:
-        # Durable preflight is intentionally local-only. It happens before the
-        # owner-fenced handoff, so a failure can release DISPATCHING to ACCEPTED
-        # without creating visible/runtime turn state.
-        try:
-            _durable_nonprovider_preflight(sid, session)
-        except Exception:
-            _refuse_durable_preprovider_projection(
-                sid, session, durable_context, started=False, invocation_started=False
-            )
-            return False
-        _durable_handoff_checkpoint(sid, session, durable_context)
+        # Scheduler already completed side-effect-free validation before PREPARING.
         handoff = _begin_durable_invocation(sid, session, durable_context, text)
         if handoff != "running":
             _refuse_durable_preprovider_projection(
@@ -11180,7 +11264,8 @@ def _run_prompt_submit(
         len(text) if isinstance(text, str) else "-",
         len(images),
     )
-    _emit("message.start", sid)
+    if durable_context is None or not durable_context.get("_message_started"):
+        _emit("message.start", sid)
 
     def run():
         # The conversation runs on a fresh thread, so ContextVars from the RPC
@@ -11260,19 +11345,8 @@ def _run_prompt_submit(
                 # the turn runs. No-op for every other session shape.
                 _sync_bot_capabilities(sid, session)
             else:
-                # RUNNING is already owner/attempt-fenced.  Durable v1 defers
-                # all stateful model/capability setup until here, before the
-                # first provider entry, so pre-handoff cancellation is pure.
-                try:
-                    _apply_pending_model_switch(sid, session)
-                    _sync_agent_model_with_config(sid, session)
-                    _sync_bot_capabilities(sid, session)
-                except Exception:
-                    _emit_durable_safe_failure(
-                        sid, session, durable_context, marker_key,
-                        state="TERMINAL_ERROR", failure_code="local_runtime_failed",
-                    )
-                    return
+                # Setup completed while PREPARING, before provider intent.
+                pass
             agent = session["agent"]
             # Snapshot after turn-start model sync. A deferred switch mutates
             # history and its version; that mutation belongs to this turn.

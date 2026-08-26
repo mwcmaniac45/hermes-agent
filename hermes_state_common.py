@@ -549,6 +549,8 @@ CREATE TABLE IF NOT EXISTS prompt_accepted_work (
     owner_token TEXT,
     owner_generation INTEGER NOT NULL DEFAULT 0,
     lease_expires_at REAL,
+    -- PREPARING is owner-fenced runtime setup; this token is never provider intent.
+    runtime_prepare_token TEXT,
     invocation_attempt_token TEXT,
     invocation_attempt_no INTEGER NOT NULL DEFAULT 0,
     safe_terminal_json TEXT,

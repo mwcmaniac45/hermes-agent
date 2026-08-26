@@ -35,6 +35,7 @@ class InvocationStatus(str, Enum):
     PENDING = "pending"
     QUEUED = "queued"
     DISPATCHING = "dispatching"
+    PREPARING = "preparing"
     INVOKING = "invoking"
     RUNNING = "running"
     COMPLETED = "completed"

@@ -874,6 +874,7 @@ class SessionSchemaMixin:
                     owner_token TEXT,
                     owner_generation INTEGER NOT NULL DEFAULT 0,
                     lease_expires_at REAL,
+                    runtime_prepare_token TEXT,
                     invocation_attempt_token TEXT,
                     invocation_attempt_no INTEGER NOT NULL DEFAULT 0,
                     safe_terminal_json TEXT,
@@ -896,12 +897,13 @@ class SessionSchemaMixin:
                 INSERT INTO prompt_accepted_work (
                     work_id, session_id, submission_id, payload_json, state,
                     owner_token, owner_generation, lease_expires_at,
-                    invocation_attempt_token, invocation_attempt_no,
+                    runtime_prepare_token, invocation_attempt_token, invocation_attempt_no,
                     safe_terminal_json, created_at, updated_at
                 )
                 SELECT w.work_id, w.session_id, w.submission_id, w.payload_json,
                        w.state, w.owner_token, w.owner_generation,
-                       w.lease_expires_at, w.invocation_attempt_token,
+                       w.lease_expires_at, w.runtime_prepare_token,
+                       w.invocation_attempt_token,
                        w.invocation_attempt_no, w.safe_terminal_json,
                        w.created_at, w.updated_at
                 FROM prompt_accepted_work_legacy_session_fk w

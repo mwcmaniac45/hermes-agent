@@ -186,7 +186,7 @@ def test_scheduler_build_failure_releases_claim_and_preserves_other_inflight(mon
             session_id="session-a", submission_id="submission-a", contract_version="1",
             semantic_fingerprint="a" * 64, payload={"text": "private text"},
         )
-        assert replay["ack"]["invocation_status"] == "accepted"
+        assert replay["ack"]["invocation_status"] == "terminal_error"
     finally:
         check.close()
     assert session["running"] is False
@@ -273,7 +273,7 @@ def test_scheduler_projects_real_accepted_work_to_completed_before_exact_replay(
         check.close()
     assert provider_entries == ["private text"]
     assert switches == ["after"]
-    assert ordering == ["running", "switch", "provider"]
+    assert ordering == ["switch", "running", "provider"]
     assert "pending_model_switch" not in session
     assert marker_starts == []
     assert not any(event[0] == "message.delta" for event in emitted)
@@ -344,13 +344,13 @@ def test_scheduler_cancellation_during_real_wait_releases_before_provider_entry(
             session_id="session-a", submission_id="submission-a", contract_version="1",
             semantic_fingerprint="a" * 64, payload={"text": "private text"},
         )
-        assert replay["ack"]["invocation_status"] == "accepted"
+        assert replay["ack"]["invocation_status"] == "terminal_error"
     finally:
         check.close()
     assert session["running"] is False
     assert "_durable_projection_work_id" not in session
     assert not session.get("inflight_turn")
-    assert not any(event[0] == "message.start" for event in emitted)
+    assert [event[0] for event in emitted].count("message.start") == 1
     assert marker_starts == []
 
 
@@ -483,13 +483,13 @@ def test_scheduler_registry_replacement_during_real_wait_releases_before_turn_st
                 session_id="session-a", submission_id="submission-a", contract_version="1",
                 semantic_fingerprint="a" * 64, payload={"text": "private text"},
             )
-            assert replay["ack"]["invocation_status"] == "accepted"
+            assert replay["ack"]["invocation_status"] == "terminal_error"
         finally:
             check.close()
         assert session["running"] is False
         assert "_durable_projection_work_id" not in session
         assert not session.get("inflight_turn")
-        assert not any(event[0] == "message.start" for event in emitted)
+        assert [event[0] for event in emitted].count("message.start") == 1
         assert marker_starts == []
         assert {key: value for key, value in replacement.items() if key != "history_lock"} == replacement_state
     finally:
@@ -536,9 +536,9 @@ def test_scheduler_transition_refusal_clears_only_matching_durable_projection_an
     if transition == "invoking":
         if raises:
             def refuse_invoking(*_a, **_k): raise RuntimeError("refused")
-            monkeypatch.setattr(SessionDB, "mark_prompt_submission_invoking", refuse_invoking)
+            monkeypatch.setattr(SessionDB, "mark_prompt_submission_invoking_from_preparing", refuse_invoking)
         else:
-            monkeypatch.setattr(SessionDB, "mark_prompt_submission_invoking", lambda *_a, **_k: None)
+            monkeypatch.setattr(SessionDB, "mark_prompt_submission_invoking_from_preparing", lambda *_a, **_k: None)
     else:
         if raises:
             def refuse_running(*_a, **_k): raise RuntimeError("refused")
@@ -554,16 +554,15 @@ def test_scheduler_transition_refusal_clears_only_matching_durable_projection_an
             session_id="session-a", submission_id="submission-a", contract_version="1",
             semantic_fingerprint="a" * 64, payload={"text": "private text"},
         )
-        assert replay["ack"]["invocation_status"] == (
-            "accepted" if transition == "invoking" else "terminal_error"
-        )
+        assert replay["ack"]["invocation_status"] == "terminal_error"
     finally:
         check.close()
     assert provider_entries == []
     assert session["running"] is False
     assert not session.get("inflight_turn")
-    # Both transition failures now occur before RUNNING permits UI publication.
-    assert not any(event[0] in {"message.start", "message.complete"} for event in emitted)
+    # PREPARING commits the paired safe UI lifecycle before provider intent.
+    assert [event[0] for event in emitted].count("message.start") == 1
+    assert [event[0] for event in emitted].count("message.complete") == 1
 
 
 @pytest.mark.parametrize("race", ("closing", "replacement"))
@@ -739,7 +738,7 @@ def test_durable_provider_failures_never_surface_hostile_data(monkeypatch, tmp_p
     assert not session.get("inflight_turn")
 
 
-@pytest.mark.parametrize("race", ("cancel", "close", "replace", "not_running"))
+@pytest.mark.parametrize("race", ("cancel", "close", "replace"))
 def test_durable_handoff_releases_post_runtime_gate_races_without_turn_side_effects(
     monkeypatch, tmp_path, race,
 ):
