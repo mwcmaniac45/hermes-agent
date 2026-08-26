@@ -2568,14 +2568,13 @@ def _durable_handoff_checkpoint(sid: str, session: dict, durable_context: dict[s
 
 
 def _durable_nonprovider_preflight(sid: str, session: dict) -> None:
-    """Apply local turn configuration before the durable invocation boundary.
+    """Reserve the pre-handoff seam for side-effect-free durable validation.
 
-    This deliberately contains no emit, marker, thread, or provider operation.
-    A failure is therefore safe to release from DISPATCHING back to ACCEPTED.
+    Durable v1 has no validation that needs to run here.  In particular, model
+    selection and Bot capability adoption mutate the live agent/session and
+    therefore belong after the owner/attempt-fenced RUNNING handoff.
     """
-    _apply_pending_model_switch(sid, session)
-    _sync_agent_model_with_config(sid, session)
-    _sync_bot_capabilities(sid, session)
+    del sid, session
 
 
 def _begin_durable_invocation(
@@ -2628,10 +2627,13 @@ def _refuse_durable_preprovider_projection(
     *,
     started: bool,
     invocation_started: bool,
+    failure_code: str = "provider_failed",
 ) -> None:
     """Owner-fence a refused projection before any provider call can begin."""
     if invocation_started and durable_context.get("attempt_token"):
-        _settle_durable_terminal(session, durable_context, state="TERMINAL_ERROR")
+        _settle_durable_terminal(
+            session, durable_context, state="TERMINAL_ERROR", failure_code=failure_code,
+        )
         with session["history_lock"]:
             if session.get("_durable_projection_work_id") == durable_context["work_id"]:
                 session.pop("_durable_projection_work_id", None)
@@ -2650,10 +2652,13 @@ def _refuse_durable_preprovider_projection(
         })
 
 
-def _settle_durable_terminal(session: dict, durable_context: dict[str, Any], *, state: str) -> bool:
+def _settle_durable_terminal(
+    session: dict, durable_context: dict[str, Any], *, state: str,
+    failure_code: str = "provider_failed",
+) -> bool:
     safe_terminal = None if state == "COMPLETED" else {
-        "layer": "provider" if state == "TERMINAL_ERROR" else "recovery",
-        "code": "provider_failed" if state == "TERMINAL_ERROR" else "unknown_outcome",
+        "layer": "runtime" if failure_code == "local_runtime_failed" else "provider" if state == "TERMINAL_ERROR" else "recovery",
+        "code": failure_code if state == "TERMINAL_ERROR" else "unknown_outcome",
         "retryable": False,
         "safe_action": "start_new_submission" if state == "TERMINAL_ERROR" else "check_transcript_resume_or_start_new",
     }
@@ -2668,12 +2673,24 @@ def _settle_durable_terminal(session: dict, durable_context: dict[str, Any], *, 
         return False
 
 
-def _emit_durable_safe_failure(sid: str, session: dict, durable_context: dict[str, Any], marker_key: str, *, state: str) -> None:
+def _emit_durable_safe_failure(
+    sid: str, session: dict, durable_context: dict[str, Any], marker_key: str, *, state: str,
+    failure_code: str = "provider_failed",
+) -> None:
     """Settle and render durable failures without retaining provider-originated data."""
-    _settle_durable_terminal(session, durable_context, state=state)
+    if durable_context.get("_safe_failure_emitted"):
+        return
+    durable_context["_safe_failure_emitted"] = True
+    _settle_durable_terminal(
+        session, durable_context, state=state, failure_code=failure_code,
+    )
     with session["history_lock"]:
         if session.get("_durable_projection_work_id") == durable_context["work_id"]:
-            _clear_inflight_turn(session)
+            session.pop("_durable_projection_work_id", None)
+            session["running"] = False
+            inflight = session.get("inflight_turn")
+            if isinstance(inflight, dict) and inflight.get("durable_work_id") == durable_context["work_id"]:
+                session.pop("inflight_turn", None)
     _retire_turn_marker(session, marker_key)
     _emit("message.complete", sid, {
         "text": "", "status": "error", "error": "Durable submission failed.",
@@ -2717,14 +2734,19 @@ def _schedule_durable_prompt_projection(session: dict, work_id: str) -> None:
                 )
                 return
             with session["history_lock"]:
-                if session.get("running") or session.get("_closing") or session.get("session_key") != sid:
-                    _refuse_durable_preprovider_projection(
-                        sid, session, durable_context, started=False, invocation_started=False
-                    )
-                    return
-                session["running"] = True
-                session["_durable_projection_work_id"] = work_id
-                session["last_active"] = time.time()
+                initial_refusal = (
+                    session.get("running") or session.get("_closing")
+                    or session.get("session_key") != sid
+                )
+                if not initial_refusal:
+                    session["running"] = True
+                    session["_durable_projection_work_id"] = work_id
+                    session["last_active"] = time.time()
+            if initial_refusal:
+                _refuse_durable_preprovider_projection(
+                    sid, session, durable_context, started=False, invocation_started=False
+                )
+                return
             _start_agent_build(sid, session)
             if _wait_agent_for_prompt(session, f"__durable__{work_id}", sid) is not None:
                 _refuse_durable_preprovider_projection(
@@ -2743,11 +2765,11 @@ def _schedule_durable_prompt_projection(session: dict, work_id: str) -> None:
                     or not session.get("running")
                     or session.get("_closing")
                 )
-                if durable_dispatch_cancelled:
-                    _refuse_durable_preprovider_projection(
-                        sid, session, durable_context, started=False, invocation_started=False
-                    )
-                    return
+            if durable_dispatch_cancelled:
+                _refuse_durable_preprovider_projection(
+                    sid, session, durable_context, started=False, invocation_started=False
+                )
+                return
             if not _run_prompt_submit(
                 f"__durable__{work_id}", sid, session, payload["text"],
                 durable_context=durable_context,
@@ -11177,6 +11199,7 @@ def _run_prompt_submit(
         secret_token = None
         goal_followup = None  # set by the post-turn goal hook below
         result = None  # turn outcome; read after the finally for leftover /steer
+        history = []  # populated after durable stateful setup succeeds
         tts_queue = None  # streaming-TTS feed for this turn (voice mode)
         thinking_started = False  # ambient thinking sound armed for this turn
         one_turn_restore = session.pop("one_turn_model_restore", None)
@@ -11236,6 +11259,20 @@ def _run_prompt_submit(
                 # (skills/toolsets/MCP/SOUL) into the eternal bot session before
                 # the turn runs. No-op for every other session shape.
                 _sync_bot_capabilities(sid, session)
+            else:
+                # RUNNING is already owner/attempt-fenced.  Durable v1 defers
+                # all stateful model/capability setup until here, before the
+                # first provider entry, so pre-handoff cancellation is pure.
+                try:
+                    _apply_pending_model_switch(sid, session)
+                    _sync_agent_model_with_config(sid, session)
+                    _sync_bot_capabilities(sid, session)
+                except Exception:
+                    _emit_durable_safe_failure(
+                        sid, session, durable_context, marker_key,
+                        state="TERMINAL_ERROR", failure_code="local_runtime_failed",
+                    )
+                    return
             agent = session["agent"]
             # Snapshot after turn-start model sync. A deferred switch mutates
             # history and its version; that mutation belongs to this turn.
@@ -12124,7 +12161,19 @@ def _run_prompt_submit(
                 file=sys.stderr,
             )
 
-    run_thread = threading.Thread(target=run, daemon=True)
+    try:
+        run_thread = threading.Thread(target=run, daemon=True)
+    except Exception:
+        if durable_context is not None:
+            _refuse_durable_preprovider_projection(
+                sid, session, durable_context, started=True, invocation_started=True,
+                failure_code="local_runtime_failed",
+            )
+        else:
+            with session["history_lock"]:
+                session["running"] = False
+        return False
+    launch_failed = False
     with _sessions_lock:
         registered = _sessions.get(sid)
         can_start = (
@@ -12133,16 +12182,22 @@ def _run_prompt_submit(
         )
         if can_start:
             session["_run_thread"] = run_thread
-            run_thread.start()
-    if not can_start:
+            try:
+                run_thread.start()
+            except Exception:
+                if session.get("_run_thread") is run_thread:
+                    session.pop("_run_thread", None)
+                launch_failed = True
+    if not can_start or launch_failed:
         if durable_context is not None:
             _refuse_durable_preprovider_projection(
-                sid, session, durable_context, started=True, invocation_started=False
+                sid, session, durable_context, started=True, invocation_started=True,
+                failure_code="local_runtime_failed",
             )
         else:
             with session["history_lock"]:
                 session["running"] = False
-    return can_start
+    return can_start and not launch_failed
 
 
 # Byte-upload attach caps. 25 MB matches Anthropic's per-image limit; 50 MB / 25

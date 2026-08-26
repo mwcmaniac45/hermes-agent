@@ -205,7 +205,7 @@ def test_scheduler_projects_real_accepted_work_to_completed_before_exact_replay(
     ready = threading.Event()
     ready.set()
     session["agent_ready"] = ready
-    switches, provider_entries, emitted, marker_starts = [], [], [], []
+    switches, provider_entries, emitted, marker_starts, ordering = [], [], [], [], []
 
     class InlineThread:
         def __init__(self, *, target, daemon):
@@ -224,6 +224,7 @@ def test_scheduler_projects_real_accepted_work_to_completed_before_exact_replay(
         interim_assistant_callback = None
         def run_conversation(self, message, **_kwargs):
             assert self.model == "after"
+            ordering.append("provider")
             provider_entries.append(message)
             return {"messages": [{"role": "user", "content": message}, {"role": "assistant", "content": "ok"}], "final_response": "ok"}
 
@@ -231,6 +232,7 @@ def test_scheduler_projects_real_accepted_work_to_completed_before_exact_replay(
     session["pending_model_switch"] = {"raw": "after", "confirm_expensive_model": False}
     def apply_switch(_sid, current, raw, **_kwargs):
         assert raw == "after"
+        ordering.append("switch")
         current["agent"].model = raw
         switches.append(raw)
         return {"value": raw, "warning": "", "confirm_required": False}
@@ -243,6 +245,13 @@ def test_scheduler_projects_real_accepted_work_to_completed_before_exact_replay(
     monkeypatch.setattr(server, "_get_usage", lambda *_a: {})
     monkeypatch.setattr(server, "_emit", lambda *a: emitted.append(a))
     monkeypatch.setattr(server, "record_turn_start", lambda *a, **_k: marker_starts.append(a))
+    original_mark_running = SessionDB.mark_prompt_submission_running
+    def mark_running(*args, **kwargs):
+        result = original_mark_running(*args, **kwargs)
+        if result:
+            ordering.append("running")
+        return result
+    monkeypatch.setattr(SessionDB, "mark_prompt_submission_running", mark_running)
 
     server._schedule_durable_prompt_projection(session, work["work_id"])
 
@@ -264,6 +273,7 @@ def test_scheduler_projects_real_accepted_work_to_completed_before_exact_replay(
         check.close()
     assert provider_entries == ["private text"]
     assert switches == ["after"]
+    assert ordering == ["running", "switch", "provider"]
     assert "pending_model_switch" not in session
     assert marker_starts == []
     assert not any(event[0] == "message.delta" for event in emitted)
@@ -643,6 +653,34 @@ def test_scheduler_invalid_payload_releases_without_agent_or_provider(monkeypatc
     assert calls == [] and session["running"] is False
 
 
+def test_scheduler_releases_history_lock_before_preprovider_refusal_helper(monkeypatch, tmp_path):
+    """The refusal helper may open the DB only after the scheduler lock exits."""
+    profile = tmp_path / "profile"
+    profile.mkdir()
+    db = SessionDB(db_path=profile / "state.db")
+    db.create_session("session-a", "tui")
+    work = _work(db)
+    db.close()
+    session = _session(profile)
+    session["running"] = True
+    lock_states = []
+
+    class InlineThread:
+        def __init__(self, *, target, daemon): self.target = target
+        def start(self): self.target()
+
+    original_refuse = server._refuse_durable_preprovider_projection
+    def refusal_after_lock(*args, **kwargs):
+        lock_states.append(session["history_lock"]._is_owned())
+        return original_refuse(*args, **kwargs)
+
+    monkeypatch.setattr(server.threading, "Thread", InlineThread)
+    monkeypatch.setattr(server, "_refuse_durable_preprovider_projection", refusal_after_lock)
+    server._schedule_durable_prompt_projection(session, work["work_id"])
+
+    assert lock_states == [False]
+
+
 @pytest.mark.parametrize("outcome", ("returned_error", "raised_error"))
 def test_durable_provider_failures_never_surface_hostile_data(monkeypatch, tmp_path, outcome, capsys):
     profile = tmp_path / "profile"
@@ -778,6 +816,85 @@ def test_durable_handoff_releases_post_runtime_gate_races_without_turn_side_effe
     assert replacement.get("inflight_turn") is None
 
 
+@pytest.mark.parametrize("race", ("cancel", "close", "replace"))
+@pytest.mark.parametrize("armed_sync", ("pending_switch", "config_mismatch", "bot_capabilities"))
+def test_durable_prehandoff_races_do_not_run_stateful_model_or_capability_sync(
+    monkeypatch, tmp_path, race, armed_sync,
+):
+    """Cancellation before RUNNING leaves every stateful turn setup untouched."""
+    profile = tmp_path / "profile"
+    profile.mkdir()
+    db = SessionDB(db_path=profile / "state.db")
+    db.create_session("session-a", "tui")
+    work = _work(db)
+    db.close()
+    session = _session(profile)
+    replacement = _session(profile, "replacement")
+    with server._sessions_lock:
+        server._sessions.pop("replacement", None)
+    session["inflight_turn"] = {"submission_id": "unrelated", "status": "running"}
+    if armed_sync == "pending_switch":
+        session["pending_model_switch"] = {"raw": "after", "confirm_expensive_model": False}
+    elif armed_sync == "config_mismatch":
+        session["configured_model"] = "after"
+    else:
+        session["bot_capability_fingerprint"] = "changed"
+    calls, emitted, markers, provider_entries = [], [], [], []
+
+    class InlineThread:
+        def __init__(self, *, target, daemon): self.target = target
+        def start(self): self.target()
+        def join(self, *_a, **_k): return None
+
+    class Agent:
+        session_id = "session-a"
+        provider = "test"
+        model = "before"
+        interim_assistant_callback = None
+        def run_conversation(self, message, **_kwargs): provider_entries.append(message)
+
+    session["agent"] = Agent()
+
+    def checkpoint(_sid, current, _context):
+        if race == "cancel":
+            with current["history_lock"]:
+                current["_turn_cancel_requested"] = True
+        elif race == "close":
+            assert server._pop_session_by_id("session-a") is current
+        else:
+            with server._sessions_lock:
+                server._sessions["session-a"] = replacement
+
+    monkeypatch.setattr(server.threading, "Thread", InlineThread)
+    monkeypatch.setattr(server, "_start_agent_build", lambda *_a: None)
+    monkeypatch.setattr(server, "_wait_agent_for_prompt", lambda *_a: None)
+    monkeypatch.setattr(server, "_apply_pending_model_switch", lambda *_a: calls.append("switch"))
+    monkeypatch.setattr(server, "_sync_agent_model_with_config", lambda *_a: calls.append("rebuild"))
+    monkeypatch.setattr(server, "_sync_bot_capabilities", lambda *_a: calls.append("capabilities"))
+    monkeypatch.setattr(server, "_emit", lambda *a: emitted.append(a))
+    monkeypatch.setattr(server, "record_turn_start", lambda *a, **_k: markers.append(a))
+    monkeypatch.setattr(server, "_durable_handoff_checkpoint", checkpoint)
+
+    server._schedule_durable_prompt_projection(session, work["work_id"])
+
+    check = SessionDB(db_path=profile / "state.db")
+    try:
+        assert check.create_or_read_prompt_submission(
+            session_id="session-a", submission_id="submission-a", contract_version="1",
+            semantic_fingerprint="a" * 64, payload={"text": "private text"},
+        )["ack"]["invocation_status"] == "accepted"
+    finally:
+        check.close()
+    assert calls == []
+    assert provider_entries == []
+    assert markers == []
+    assert not any(event[0] in {"message.start", "message.complete", "session.info"} for event in emitted)
+    assert session["inflight_turn"] == {"submission_id": "unrelated", "status": "running"}
+    assert session.get("pending_model_switch") == (
+        {"raw": "after", "confirm_expensive_model": False} if armed_sync == "pending_switch" else None
+    )
+
+
 def test_durable_preflight_failure_releases_without_unknown_or_turn_side_effects(monkeypatch, tmp_path):
     """Explicit non-provider preflight failures are still pre-invocation."""
     profile = tmp_path / "profile"
@@ -818,6 +935,134 @@ def test_durable_preflight_failure_releases_without_unknown_or_turn_side_effects
     assert not any(event[0] == "message.start" for event in emitted)
     assert markers == []
     assert session["inflight_turn"] == {"submission_id": "unrelated", "status": "running"}
+
+
+@pytest.mark.parametrize("launch_failure", ("registry", "construct", "start"))
+def test_post_running_launch_failures_terminalize_without_provider_entry(
+    monkeypatch, tmp_path, launch_failure,
+):
+    """No failed thread launch may release an owner/attempt already at RUNNING."""
+    profile = tmp_path / "profile"
+    profile.mkdir()
+    db = SessionDB(db_path=profile / "state.db")
+    db.create_session("session-a", "tui")
+    work = _work(db)
+    claim = db.claim_prompt_submission_work(
+        work["work_id"], owner_token="owner-a", session_id="session-a",
+    )
+    db.close()
+    session = _session(profile)
+    session.update({
+        "running": True,
+        "_durable_projection_work_id": work["work_id"],
+        "inflight_turn": {"submission_id": "unrelated", "status": "running"},
+    })
+    provider_entries, emitted = [], []
+
+    class Agent:
+        def run_conversation(self, *_a, **_k): provider_entries.append(True)
+    session["agent"] = Agent()
+    context = {
+        "work_id": work["work_id"], "owner_token": "owner-a",
+        "owner_generation": claim["owner_generation"], "attempt_token": None,
+        "session_id": "session-a",
+    }
+    if launch_failure == "registry":
+        original_begin = server._begin_durable_invocation
+        def begin_then_close(*args):
+            result = original_begin(*args)
+            session["_closing"] = True
+            return result
+        monkeypatch.setattr(server, "_begin_durable_invocation", begin_then_close)
+    elif launch_failure == "construct":
+        def broken_thread(**_kwargs): raise RuntimeError("private construction failure")
+        monkeypatch.setattr(server.threading, "Thread", broken_thread)
+    else:
+        class BrokenStartThread:
+            def __init__(self, **_kwargs): pass
+            def start(self): raise RuntimeError("private start failure")
+        monkeypatch.setattr(server.threading, "Thread", BrokenStartThread)
+    monkeypatch.setattr(server, "_emit", lambda *args: emitted.append(args))
+
+    assert server._run_prompt_submit(
+        "__durable__launch", "session-a", session, "private text", durable_context=context,
+    ) is False
+
+    check = SessionDB(db_path=profile / "state.db")
+    try:
+        replay = check.create_or_read_prompt_submission(
+            session_id="session-a", submission_id="submission-a", contract_version="1",
+            semantic_fingerprint="a" * 64, payload={"text": "private text"},
+        )
+        assert replay["ack"]["invocation_status"] == "terminal_error"
+        row = check._conn.execute(
+            "SELECT safe_terminal_json FROM prompt_accepted_work WHERE work_id=?", (work["work_id"],),
+        ).fetchone()
+        assert "local_runtime_failed" in row[0]
+    finally:
+        check.close()
+    assert provider_entries == []
+    assert [event[0] for event in emitted].count("message.start") == 1
+    assert [event[0] for event in emitted].count("message.complete") == 1
+    assert emitted[-1][2] == {
+        "text": "", "status": "error", "error": "Durable submission failed.", "recoverable": False,
+    }
+    assert session["inflight_turn"] == {"submission_id": "unrelated", "status": "running"}
+    assert "_durable_projection_work_id" not in session
+
+
+@pytest.mark.parametrize("sync_name", (
+    "_apply_pending_model_switch", "_sync_agent_model_with_config", "_sync_bot_capabilities",
+))
+def test_post_running_stateful_sync_failure_terminalizes_before_provider(
+    monkeypatch, tmp_path, sync_name,
+):
+    """Deferred durable setup failures are local-runtime terminals, never releases."""
+    profile = tmp_path / "profile"
+    profile.mkdir()
+    db = SessionDB(db_path=profile / "state.db")
+    db.create_session("session-a", "tui")
+    work = _work(db)
+    db.close()
+    session = _session(profile)
+    emitted, provider_entries = [], []
+
+    class InlineThread:
+        def __init__(self, *, target, daemon): self.target = target
+        def start(self): self.target()
+        def join(self, *_a, **_k): return None
+
+    class Agent:
+        session_id = "session-a"
+        provider = "test"
+        model = "test"
+        interim_assistant_callback = None
+        def run_conversation(self, *_a, **_k): provider_entries.append(True)
+    session["agent"] = Agent()
+    monkeypatch.setattr(server.threading, "Thread", InlineThread)
+    monkeypatch.setattr(server, "_start_agent_build", lambda *_a: None)
+    monkeypatch.setattr(server, "_wait_agent_for_prompt", lambda *_a: None)
+    monkeypatch.setattr(server, sync_name, lambda *_a: (_ for _ in ()).throw(RuntimeError("private setup failure")))
+    monkeypatch.setattr(server, "_emit", lambda *args: emitted.append(args))
+
+    server._schedule_durable_prompt_projection(session, work["work_id"])
+
+    check = SessionDB(db_path=profile / "state.db")
+    try:
+        replay = check.create_or_read_prompt_submission(
+            session_id="session-a", submission_id="submission-a", contract_version="1",
+            semantic_fingerprint="a" * 64, payload={"text": "private text"},
+        )
+        assert replay["ack"]["invocation_status"] == "terminal_error"
+        row = check._conn.execute(
+            "SELECT safe_terminal_json FROM prompt_accepted_work WHERE work_id=?", (work["work_id"],),
+        ).fetchone()
+        assert "local_runtime_failed" in row[0]
+    finally:
+        check.close()
+    assert provider_entries == []
+    assert [event[0] for event in emitted].count("message.start") == 1
+    assert [event[0] for event in emitted].count("message.complete") == 1
 
 
 def test_durable_handoff_wins_when_interrupt_is_waiting_on_history_lock(tmp_path):

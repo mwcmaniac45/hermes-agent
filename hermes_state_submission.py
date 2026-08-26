@@ -27,8 +27,8 @@ _DISPLAY_KINDS = frozenset({"normal", "voice", "continuation"})
 _TRUNCATION_TARGETS = frozenset({"message", "prompt", "attachment"})
 _ATTACHMENT_STATUSES = frozenset({"ready", "missing", "reattach_required"})
 _SAFE_TERMINAL_FIELDS = frozenset({"layer", "code", "retryable", "safe_action"})
-_SAFE_LAYERS = frozenset({"admission", "attachment", "provider", "recovery"})
-_SAFE_CODES = frozenset({"storage_failed", "provider_failed", "attachment_reattach_required", "unknown_outcome"})
+_SAFE_LAYERS = frozenset({"admission", "attachment", "provider", "recovery", "runtime"})
+_SAFE_CODES = frozenset({"storage_failed", "provider_failed", "local_runtime_failed", "attachment_reattach_required", "unknown_outcome"})
 _SAFE_ACTIONS = frozenset(_SAFE_ACTION.values())
 # Durable attachment strings are opaque local metadata, never renderer handles:
 # identity is a 1-64 ASCII identifier; version is a v-prefixed numeric version.
