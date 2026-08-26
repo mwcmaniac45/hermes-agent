@@ -11621,6 +11621,7 @@ def _run_prompt_submit(
                             with _session_db(session) as durable_db:
                                 if durable_db is None or not durable_db.renew_prompt_submission_lease(
                                     durable_context["work_id"], owner_token=durable_context["owner_token"],
+                                    owner_generation=durable_context["owner_generation"],
                                     attempt_token=durable_context["attempt_token"],
                                 ):
                                     return

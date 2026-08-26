@@ -194,6 +194,102 @@ def test_scheduler_build_failure_releases_claim_and_preserves_other_inflight(mon
     assert provider_entries == []
 
 
+def test_runtime_invocation_lease_renewal_passes_exact_generation_and_preserves_live_witness(monkeypatch, tmp_path):
+    """PROVENANCE_UNVERIFIED — execute the runtime lease closure through a real DB."""
+    profile = tmp_path / "profile"
+    profile.mkdir()
+    db = SessionDB(db_path=profile / "state.db")
+    db.create_session("session-a", "tui")
+    work = _work(db)
+    claim = db.claim_prompt_submission_work(
+        work["work_id"], owner_token="owner-a", session_id="session-a", lease_seconds=1,
+    )
+    original_expiry = db._conn.execute(
+        "SELECT lease_expires_at FROM prompt_accepted_work WHERE work_id=?", (work["work_id"],)
+    ).fetchone()[0]
+    db.close()
+
+    session = _session(profile)
+    session.update({"running": True, "_durable_projection_work_id": work["work_id"]})
+    renewed = []
+
+    class OneTickEvent:
+        def __init__(self):
+            self.waits = 0
+        def wait(self, _timeout=None):
+            self.waits += 1
+            return self.waits > 1
+        def set(self):
+            return None
+
+    class InlineThread:
+        def __init__(self, *, target, daemon):
+            self.target = target
+        def start(self):
+            self.target()
+        def join(self):
+            return None
+
+    class Agent:
+        session_id = "session-a"
+        provider = "test"
+        model = "test"
+        interim_assistant_callback = None
+        def run_conversation(self, *_args, **_kwargs):
+            return {"final_response": "ok"}
+
+    original_renew = SessionDB.renew_prompt_submission_lease
+    def renew_with_observation(self, work_id, *, owner_token, owner_generation, attempt_token, lease_seconds=30):
+        renewed.append((work_id, owner_token, owner_generation, attempt_token))
+        return original_renew(
+            self, work_id, owner_token=owner_token, owner_generation=owner_generation,
+            attempt_token=attempt_token, lease_seconds=lease_seconds,
+        )
+
+    session["agent"] = Agent()
+    durable_context = {
+        "work_id": work["work_id"], "owner_token": "owner-a",
+        "owner_generation": claim["owner_generation"], "attempt_token": None,
+        "session_id": "session-a",
+    }
+    monkeypatch.setattr(server.threading, "Event", OneTickEvent)
+    monkeypatch.setattr(server.uuid, "uuid4", lambda: "attempt-a")
+    monkeypatch.setattr(server.threading, "Thread", InlineThread)
+    monkeypatch.setattr(server, "_RealThread", InlineThread)
+    monkeypatch.setattr(server, "_sync_agent_model_with_config", lambda *_a: None)
+    monkeypatch.setattr(server, "_sync_bot_capabilities", lambda *_a: None)
+    monkeypatch.setattr(server, "_start_usage_ticker", lambda *_a: (OneTickEvent(), InlineThread(target=lambda: None, daemon=True)))
+    monkeypatch.setattr(server, "_get_usage", lambda *_a: {})
+    monkeypatch.setattr(server, "_emit", lambda *_a: None)
+    monkeypatch.setattr(server, "_settle_durable_terminal", lambda *_a, **_k: True)
+    monkeypatch.setattr(SessionDB, "renew_prompt_submission_lease", renew_with_observation)
+
+    server._run_prompt_submit(
+        "__durable__lease-renewal", "session-a", session, "private text", durable_context=durable_context,
+    )
+    assert renewed == [(work["work_id"], "owner-a", claim["owner_generation"], "attempt-a")]
+
+    check = SessionDB(db_path=profile / "state.db")
+    try:
+        renewed_expiry = check._conn.execute(
+            "SELECT lease_expires_at FROM prompt_accepted_work WHERE work_id=?", (work["work_id"],)
+        ).fetchone()[0]
+        assert renewed_expiry > original_expiry
+        assert check.recover_prompt_submission_work(
+            now=original_expiry + 1,
+            live_owner_witnesses=[{
+                "work_id": work["work_id"], "owner_generation": claim["owner_generation"],
+                "owner_token": "owner-a", "invocation_attempt_token": "attempt-a",
+            }],
+        ) == []
+        assert check.create_or_read_prompt_submission(
+            session_id="session-a", submission_id="submission-a", contract_version="1",
+            semantic_fingerprint="a" * 64, payload={"text": "private text"},
+        )["ack"]["invocation_status"] == "running"
+    finally:
+        check.close()
+
+
 def test_scheduler_projects_real_accepted_work_to_completed_before_exact_replay(monkeypatch, tmp_path):
     profile = tmp_path / "profile"
     profile.mkdir()
