@@ -344,6 +344,66 @@ def test_scheduler_cancellation_during_real_wait_releases_before_provider_entry(
     assert marker_starts == []
 
 
+def test_durable_runtime_entry_cancellation_releases_only_matching_projection(monkeypatch, tmp_path):
+    """A cancellation observed at durable runtime entry must stay pre-invocation."""
+    profile = tmp_path / "profile"
+    profile.mkdir()
+    db = SessionDB(db_path=profile / "state.db")
+    db.create_session("session-a", "tui")
+    work = _work(db)
+    owner_token = "owner-a"
+    claim = db.claim_prompt_submission_work(
+        work["work_id"], owner_token=owner_token, session_id="session-a"
+    )
+    db.close()
+    session = _session(profile)
+    session.update({
+        "running": True,
+        "_durable_projection_work_id": work["work_id"],
+        "_turn_cancel_requested": True,
+        "inflight_turn": {"submission_id": "another-turn", "status": "running"},
+    })
+    provider_entries, emitted, marker_starts = [], [], []
+
+    class Agent:
+        def run_conversation(self, *_args, **_kwargs):
+            provider_entries.append(True)
+
+    session["agent"] = Agent()
+    durable_context = {
+        "work_id": work["work_id"],
+        "owner_token": owner_token,
+        "owner_generation": claim["owner_generation"],
+        "attempt_token": None,
+        "session_id": "session-a",
+    }
+    monkeypatch.setattr(server, "_emit", lambda *args: emitted.append(args))
+    monkeypatch.setattr(
+        server, "record_turn_start", lambda *args, **kwargs: marker_starts.append(args)
+    )
+
+    assert server._run_prompt_submit(
+        "__durable__runtime-entry", "session-a", session, "private text",
+        durable_context=durable_context,
+    ) is False
+
+    check = SessionDB(db_path=profile / "state.db")
+    try:
+        replay = check.create_or_read_prompt_submission(
+            session_id="session-a", submission_id="submission-a", contract_version="1",
+            semantic_fingerprint="a" * 64, payload={"text": "private text"},
+        )
+        assert replay["ack"]["invocation_status"] == "accepted"
+    finally:
+        check.close()
+    assert provider_entries == []
+    assert session["running"] is False
+    assert "_durable_projection_work_id" not in session
+    assert session["inflight_turn"] == {"submission_id": "another-turn", "status": "running"}
+    assert not any(event[0] == "message.start" for event in emitted)
+    assert marker_starts == []
+
+
 def test_scheduler_registry_replacement_during_real_wait_releases_before_turn_start(monkeypatch, tmp_path):
     """A replaced durable session must release before it creates or starts a turn."""
     profile = tmp_path / "profile"
