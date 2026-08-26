@@ -192,28 +192,28 @@ class SessionSubmissionMixin:
             }
         return self._execute_write(write)
 
-    def release_prompt_submission_dispatch(self, work_id: str, *, owner_token: str) -> bool:
+    def release_prompt_submission_dispatch(self, work_id: str, *, owner_token: str, owner_generation: int) -> bool:
         """Release only this owner's uninvoked DISPATCHING claim back to ACCEPTED."""
         return self._execute_write(lambda conn: conn.execute(
             "UPDATE prompt_accepted_work SET state='ACCEPTED', owner_token=NULL, "
             "lease_expires_at=NULL, updated_at=? WHERE work_id=? AND owner_token=? "
-            "AND state='DISPATCHING' AND invocation_attempt_token IS NULL",
-            (time.time(), work_id, owner_token),
+            "AND owner_generation=? AND state='DISPATCHING' AND invocation_attempt_token IS NULL",
+            (time.time(), work_id, owner_token, owner_generation),
         ).rowcount == 1)
 
-    def mark_prompt_submission_preparing(self, work_id: str, *, owner_token: str,
+    def mark_prompt_submission_preparing(self, work_id: str, *, owner_token: str, owner_generation: int,
                                          prepare_token: str, lease_seconds: float = 30) -> dict[str, Any] | None:
         """Fence runtime-only preparation before any provider boundary."""
         now = time.time()
         changed = self._execute_write(lambda conn: conn.execute(
             "UPDATE prompt_accepted_work SET state='PREPARING', runtime_prepare_token=?, "
             "lease_expires_at=?, updated_at=? WHERE work_id=? AND owner_token=? "
-            "AND state='DISPATCHING' AND invocation_attempt_token IS NULL",
-            (prepare_token, now + lease_seconds, now, work_id, owner_token),
+            "AND owner_generation=? AND state='DISPATCHING' AND invocation_attempt_token IS NULL",
+            (prepare_token, now + lease_seconds, now, work_id, owner_token, owner_generation),
         ).rowcount)
         return {"state": "PREPARING", "runtime_prepare_token": prepare_token} if changed == 1 else None
 
-    def mark_prompt_submission_invoking_from_preparing(self, work_id: str, *, owner_token: str,
+    def mark_prompt_submission_invoking_from_preparing(self, work_id: str, *, owner_token: str, owner_generation: int,
                                                        prepare_token: str, attempt_token: str,
                                                        lease_seconds: float = 30) -> dict[str, Any] | None:
         """Record provider intent only after exact runtime preparation succeeds."""
@@ -221,12 +221,12 @@ class SessionSubmissionMixin:
         changed = self._execute_write(lambda conn: conn.execute(
             "UPDATE prompt_accepted_work SET state='INVOKING', invocation_attempt_token=?, "
             "invocation_attempt_no=invocation_attempt_no+1, lease_expires_at=?, updated_at=? "
-            "WHERE work_id=? AND owner_token=? AND runtime_prepare_token=? AND state='PREPARING'",
-            (attempt_token, now + lease_seconds, now, work_id, owner_token, prepare_token),
+            "WHERE work_id=? AND owner_token=? AND owner_generation=? AND runtime_prepare_token=? AND state='PREPARING'",
+            (attempt_token, now + lease_seconds, now, work_id, owner_token, owner_generation, prepare_token),
         ).rowcount)
         return {"state": "INVOKING", "invocation_attempt_token": attempt_token} if changed == 1 else None
 
-    def complete_prompt_submission_preparing(self, work_id: str, *, owner_token: str,
+    def complete_prompt_submission_preparing(self, work_id: str, *, owner_token: str, owner_generation: int,
                                              prepare_token: str, state: str,
                                              safe_terminal: dict[str, Any] | None = None) -> bool:
         """Terminalize an exact pre-provider owner; never release committed setup."""
@@ -235,42 +235,52 @@ class SessionSubmissionMixin:
         return self._execute_write(lambda conn: conn.execute(
             "UPDATE prompt_accepted_work SET state=?, safe_terminal_json=?, owner_token=NULL, "
             "lease_expires_at=NULL, updated_at=? WHERE work_id=? AND owner_token=? "
-            "AND runtime_prepare_token=? AND state='PREPARING'",
-            (state, json.dumps(summary, sort_keys=True), time.time(), work_id, owner_token, prepare_token),
+            "AND owner_generation=? AND runtime_prepare_token=? AND state='PREPARING'",
+            (state, json.dumps(summary, sort_keys=True), time.time(), work_id, owner_token, owner_generation, prepare_token),
         ).rowcount == 1)
 
-    def mark_prompt_submission_invoking(self, work_id: str, *, owner_token: str, attempt_token: str, lease_seconds: float = 30) -> dict[str, Any] | None:
+    def mark_prompt_submission_invoking(self, work_id: str, *, owner_token: str, owner_generation: int, attempt_token: str, lease_seconds: float = 30) -> dict[str, Any] | None:
         """Compatibility handoff for callers that have not entered PREPARING."""
         now = time.time()
         def write(conn):
-            changed = conn.execute("UPDATE prompt_accepted_work SET state='INVOKING', invocation_attempt_token=?, invocation_attempt_no=invocation_attempt_no+1, lease_expires_at=?, updated_at=? WHERE work_id=? AND owner_token=? AND state='DISPATCHING'", (attempt_token, now + lease_seconds, now, work_id, owner_token)).rowcount
+            changed = conn.execute("UPDATE prompt_accepted_work SET state='INVOKING', invocation_attempt_token=?, invocation_attempt_no=invocation_attempt_no+1, lease_expires_at=?, updated_at=? WHERE work_id=? AND owner_token=? AND owner_generation=? AND state='DISPATCHING'", (attempt_token, now + lease_seconds, now, work_id, owner_token, owner_generation)).rowcount
             return {"state": "INVOKING", "invocation_attempt_token": attempt_token} if changed == 1 else None
         return self._execute_write(write)
 
-    def mark_prompt_submission_running(self, work_id: str, *, owner_token: str,
+    def mark_prompt_submission_running(self, work_id: str, *, owner_token: str, owner_generation: int,
                                        attempt_token: str, lease_seconds: float = 30) -> bool:
         now = time.time()
         return self._execute_write(lambda conn: conn.execute(
             "UPDATE prompt_accepted_work SET state='RUNNING', lease_expires_at=?, updated_at=? "
-            "WHERE work_id=? AND owner_token=? AND invocation_attempt_token=? AND state='INVOKING'",
-            (now + lease_seconds, now, work_id, owner_token, attempt_token),
+            "WHERE work_id=? AND owner_token=? AND owner_generation=? AND invocation_attempt_token=? AND state='INVOKING'",
+            (now + lease_seconds, now, work_id, owner_token, owner_generation, attempt_token),
         ).rowcount == 1)
 
-    def renew_prompt_submission_lease(self, work_id: str, *, owner_token: str,
+    def renew_prompt_submission_lease(self, work_id: str, *, owner_token: str, owner_generation: int,
                                       attempt_token: str, lease_seconds: float = 30) -> bool:
         """Renew only the exact invocation owner/attempt currently at the boundary."""
         now = time.time()
         return self._execute_write(lambda conn: conn.execute(
             "UPDATE prompt_accepted_work SET lease_expires_at=?, updated_at=? "
-            "WHERE work_id=? AND owner_token=? AND invocation_attempt_token=? "
+            "WHERE work_id=? AND owner_token=? AND owner_generation=? AND invocation_attempt_token=? "
             "AND state IN ('INVOKING','RUNNING')",
-            (now + lease_seconds, now, work_id, owner_token, attempt_token),
+            (now + lease_seconds, now, work_id, owner_token, owner_generation, attempt_token),
         ).rowcount == 1)
 
-    def complete_prompt_submission_work(self, work_id: str, *, owner_token: str, attempt_token: str, state: str, safe_terminal: dict[str, Any] | None = None) -> bool:
+    def renew_prompt_submission_preparing_lease(self, work_id: str, *, owner_token: str, owner_generation: int,
+                                                prepare_token: str, lease_seconds: float = 30) -> bool:
+        """Renew only the exact PREPARING owner; invocation tokens never apply."""
+        now = time.time()
+        return self._execute_write(lambda conn: conn.execute(
+            "UPDATE prompt_accepted_work SET lease_expires_at=?, updated_at=? "
+            "WHERE work_id=? AND owner_token=? AND owner_generation=? AND runtime_prepare_token=? AND state='PREPARING'",
+            (now + lease_seconds, now, work_id, owner_token, owner_generation, prepare_token),
+        ).rowcount == 1)
+
+    def complete_prompt_submission_work(self, work_id: str, *, owner_token: str, owner_generation: int, attempt_token: str, state: str, safe_terminal: dict[str, Any] | None = None) -> bool:
         if state not in _TERMINAL: raise ValueError("invalid durable terminal state")
         summary = _safe_terminal_summary(safe_terminal)
-        return self._execute_write(lambda conn: conn.execute("UPDATE prompt_accepted_work SET state=?, safe_terminal_json=?, owner_token=NULL, lease_expires_at=NULL, updated_at=? WHERE work_id=? AND owner_token=? AND invocation_attempt_token=? AND state IN ('INVOKING','RUNNING')", (state, json.dumps(summary, sort_keys=True), time.time(), work_id, owner_token, attempt_token)).rowcount == 1)
+        return self._execute_write(lambda conn: conn.execute("UPDATE prompt_accepted_work SET state=?, safe_terminal_json=?, owner_token=NULL, lease_expires_at=NULL, updated_at=? WHERE work_id=? AND owner_token=? AND owner_generation=? AND invocation_attempt_token=? AND state IN ('INVOKING','RUNNING')", (state, json.dumps(summary, sort_keys=True), time.time(), work_id, owner_token, owner_generation, attempt_token)).rowcount == 1)
 
     def recover_prompt_submission_work(self, *, session_id: str | None = None,
                                        now: float | None = None,

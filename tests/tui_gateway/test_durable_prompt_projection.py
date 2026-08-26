@@ -102,7 +102,7 @@ def test_fresh_session_scoped_recovery_marks_only_its_invocation_unknown(tmp_pat
         first, second = _work(db, "session-a", "first"), _work(db, "session-b", "second")
         for work, owner, attempt in ((first, "owner-a", "attempt-a"), (second, "owner-b", "attempt-b")):
             db.claim_prompt_submission_work(work["work_id"], owner_token=owner, session_id=work is first and "session-a" or "session-b")
-            db.mark_prompt_submission_invoking(work["work_id"], owner_token=owner, attempt_token=attempt)
+            db.mark_prompt_submission_invoking(work["work_id"], owner_token=owner, owner_generation=1, attempt_token=attempt)
         assert db.recover_prompt_submission_work(session_id="session-a", now=0) == []
         assert db.create_or_read_prompt_submission(
             session_id="session-a", submission_id="first", contract_version="1", semantic_fingerprint="a" * 64, payload={"text": "private text"}
@@ -119,18 +119,18 @@ def test_owner_attempt_fencing_rejects_stale_renewal_and_settlement(tmp_path):
     try:
         work = _work(db)
         db.claim_prompt_submission_work(work["work_id"], owner_token="owner-a", session_id="session-a")
-        db.mark_prompt_submission_invoking(work["work_id"], owner_token="owner-a", attempt_token="attempt-a")
+        db.mark_prompt_submission_invoking(work["work_id"], owner_token="owner-a", owner_generation=1, attempt_token="attempt-a")
         assert db.renew_prompt_submission_lease(
-            work["work_id"], owner_token="owner-b", attempt_token="attempt-a", lease_seconds=60
+            work["work_id"], owner_token="owner-b", owner_generation=1, attempt_token="attempt-a", lease_seconds=60
         ) is False
         assert db.renew_prompt_submission_lease(
-            work["work_id"], owner_token="owner-a", attempt_token="attempt-b", lease_seconds=60
+            work["work_id"], owner_token="owner-a", owner_generation=1, attempt_token="attempt-b", lease_seconds=60
         ) is False
         assert db.complete_prompt_submission_work(
-            work["work_id"], owner_token="owner-b", attempt_token="attempt-a", state="COMPLETED"
+            work["work_id"], owner_token="owner-b", owner_generation=1, attempt_token="attempt-a", state="COMPLETED"
         ) is False
         assert db.renew_prompt_submission_lease(
-            work["work_id"], owner_token="owner-a", attempt_token="attempt-a", lease_seconds=60
+            work["work_id"], owner_token="owner-a", owner_generation=1, attempt_token="attempt-a", lease_seconds=60
         ) is True
     finally:
         db.close()
@@ -142,10 +142,10 @@ def test_dispatching_owner_can_release_only_its_uninvoked_claim(tmp_path):
         work = _work(db)
         db.claim_prompt_submission_work(work["work_id"], owner_token="owner-a", session_id="session-a")
         assert db.release_prompt_submission_dispatch(
-            work["work_id"], owner_token="owner-b"
+            work["work_id"], owner_token="owner-b", owner_generation=1
         ) is False
         assert db.release_prompt_submission_dispatch(
-            work["work_id"], owner_token="owner-a"
+            work["work_id"], owner_token="owner-a", owner_generation=1
         ) is True
         replay = db.create_or_read_prompt_submission(
             session_id="session-a", submission_id="submission-a", contract_version="1",

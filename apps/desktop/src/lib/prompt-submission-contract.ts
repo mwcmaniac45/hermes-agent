@@ -29,6 +29,7 @@ export type InvocationStatus =
   | 'pending'
   | 'queued'
   | 'dispatching'
+  | 'preparing'
   | 'invoking'
   | 'running'
   | 'completed'
@@ -256,6 +257,15 @@ const REQUIRED_ACK_FIELDS = [
   'safe_terminal_action',
 ] as const;
 
+const DURABLE_ADMISSION_STATUSES = new Set<DurableAdmissionStatus>(['accepted', 'conflict']);
+const INVOCATION_STATUSES = new Set<InvocationStatus>([
+  'pending', 'queued', 'dispatching', 'preparing', 'invoking', 'running', 'completed',
+  'terminal_error', 'attachment_reattach_required', 'unknown_outcome',
+]);
+const SAFE_TERMINAL_ACTIONS = new Set<SafeTerminalAction>([
+  'check_transcript_resume_or_start_new', 'reattach_then_continue', 'start_new_submission',
+]);
+
 /**
  * Validate and construct a PromptSubmissionV1 from an unknown value.
  * Throws on missing required fields or contract version mismatch.
@@ -305,13 +315,26 @@ export function validateAck(data: unknown): PromptSubmissionAckV1 {
     throw new Error(`Missing required ack fields: ${missing.join(', ')}`);
   }
 
+  const durableAdmissionStatus = obj['durable_admission_status'];
+  const invocationStatus = obj['invocation_status'];
+  const safeTerminalAction = obj['safe_terminal_action'];
+  if (typeof durableAdmissionStatus !== 'string' || !DURABLE_ADMISSION_STATUSES.has(durableAdmissionStatus as DurableAdmissionStatus)) {
+    throw new Error('Unknown durable_admission_status');
+  }
+  if (typeof invocationStatus !== 'string' || !INVOCATION_STATUSES.has(invocationStatus as InvocationStatus)) {
+    throw new Error('Unknown invocation_status');
+  }
+  if (safeTerminalAction !== null && (typeof safeTerminalAction !== 'string' || !SAFE_TERMINAL_ACTIONS.has(safeTerminalAction as SafeTerminalAction))) {
+    throw new Error('Unknown safe_terminal_action');
+  }
+
   return {
     submission_id: String(obj['submission_id']),
     contract_version: String(obj['contract_version']),
     semantic_fingerprint: String(obj['semantic_fingerprint']),
-    durable_admission_status: obj['durable_admission_status'] as DurableAdmissionStatus,
-    invocation_status: obj['invocation_status'] as InvocationStatus,
-    safe_terminal_action: (obj['safe_terminal_action'] as SafeTerminalAction | null) ?? null,
+    durable_admission_status: durableAdmissionStatus as DurableAdmissionStatus,
+    invocation_status: invocationStatus as InvocationStatus,
+    safe_terminal_action: safeTerminalAction as SafeTerminalAction | null,
   };
 }
 

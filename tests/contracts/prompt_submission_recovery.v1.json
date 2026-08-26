@@ -35,6 +35,7 @@
       "pending",
       "queued",
       "dispatching",
+      "preparing",
       "invoking",
       "running",
       "completed",

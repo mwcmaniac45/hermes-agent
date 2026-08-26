@@ -52,7 +52,7 @@ def test_recovery_reattaches_proven_unexpired_live_owner_and_completion_survives
         )
         claim = db.claim_prompt_submission_work(work["work_id"], owner_token="owner", lease_seconds=60)
         attempt = db.mark_prompt_submission_invoking(
-            work["work_id"], owner_token="owner", attempt_token="attempt", lease_seconds=60,
+            work["work_id"], owner_token="owner", owner_generation=1, attempt_token="attempt", lease_seconds=60,
         )
         assert db.recover_prompt_submission_work(
             now=0,
@@ -64,7 +64,7 @@ def test_recovery_reattaches_proven_unexpired_live_owner_and_completion_survives
             }],
         ) == []
         assert db.complete_prompt_submission_work(
-            work["work_id"], owner_token="owner", attempt_token="attempt", state="COMPLETED",
+            work["work_id"], owner_token="owner", owner_generation=1, attempt_token="attempt", state="COMPLETED",
         ) is True
     finally:
         db.close()
@@ -154,12 +154,12 @@ def test_conflicting_same_id_cannot_settle_original_pending_work(tmp_path):
         assert conflict == {"created": False, "conflict": True, "code": 4091}
         claim = db.claim_prompt_submission_work(created["work_id"], owner_token="owner-a")
         attempt = db.mark_prompt_submission_invoking(
-            created["work_id"], owner_token="owner-a", attempt_token="attempt-a"
+            created["work_id"], owner_token="owner-a", owner_generation=1, attempt_token="attempt-a"
         )
         assert claim["state"] == "DISPATCHING"
         assert attempt["state"] == "INVOKING"
         assert db.complete_prompt_submission_work(
-            created["work_id"], owner_token="owner-a", attempt_token="attempt-a", state="COMPLETED"
+            created["work_id"], owner_token="owner-a", owner_generation=1, attempt_token="attempt-a", state="COMPLETED"
         ) is True
         replay = db.create_or_read_prompt_submission(
             session_id="stored-session",
@@ -258,9 +258,9 @@ def test_invocation_crashes_become_unknown_outcome_without_provider_retry(tmp_pa
     for suffix, reached_provider in (("before", 0), ("after", 1)):
         work = db.create_or_read_prompt_submission(session_id="stored-session", submission_id=f"invoke-{suffix}", contract_version="1", semantic_fingerprint=("f" if suffix == "before" else "a") * 64, payload={"text": "private"})
         db.claim_prompt_submission_work(work["work_id"], owner_token=f"owner-{suffix}")
-        db.mark_prompt_submission_invoking(work["work_id"], owner_token=f"owner-{suffix}", attempt_token=f"attempt-{suffix}")
+        db.mark_prompt_submission_invoking(work["work_id"], owner_token=f"owner-{suffix}", owner_generation=1, attempt_token=f"attempt-{suffix}")
         if reached_provider:
-            assert db.mark_prompt_submission_running(work["work_id"], owner_token=f"owner-{suffix}", attempt_token=f"attempt-{suffix}")
+            assert db.mark_prompt_submission_running(work["work_id"], owner_token=f"owner-{suffix}", owner_generation=1, attempt_token=f"attempt-{suffix}")
     assert db.recover_prompt_submission_work() == []
     for suffix in ("before", "after"):
         replay = db.create_or_read_prompt_submission(session_id="stored-session", submission_id=f"invoke-{suffix}", contract_version="1", semantic_fingerprint=("f" if suffix == "before" else "a") * 64, payload={"text": "private"})
@@ -273,8 +273,8 @@ def test_hostile_persistence_error_never_enters_safe_receipt_or_replay(tmp_path)
     hostile = "prompt=steal https://secret.example/?token=abc traceback"
     work = db.create_or_read_prompt_submission(session_id="stored-session", submission_id="safe-1", contract_version="1", semantic_fingerprint="9" * 64, payload={"text": "private prompt"})
     db.claim_prompt_submission_work(work["work_id"], owner_token="owner")
-    db.mark_prompt_submission_invoking(work["work_id"], owner_token="owner", attempt_token="attempt")
-    assert db.complete_prompt_submission_work(work["work_id"], owner_token="owner", attempt_token="attempt", state="TERMINAL_ERROR", safe_terminal={"layer": "provider", "code": "storage_failed", "retryable": False, "safe_action": "start_new_submission"})
+    db.mark_prompt_submission_invoking(work["work_id"], owner_token="owner", owner_generation=1, attempt_token="attempt")
+    assert db.complete_prompt_submission_work(work["work_id"], owner_token="owner", owner_generation=1, attempt_token="attempt", state="TERMINAL_ERROR", safe_terminal={"layer": "provider", "code": "storage_failed", "retryable": False, "safe_action": "start_new_submission"})
     replay = db.create_or_read_prompt_submission(session_id="stored-session", submission_id="safe-1", contract_version="1", semantic_fingerprint="9" * 64, payload={"text": "private prompt"})
     assert hostile not in str(replay)
     with db._lock:
@@ -318,7 +318,7 @@ def test_recovery_rejects_mismatched_or_expired_live_owner_witnesses(tmp_path):
             work = db.create_or_read_prompt_submission(session_id="stored-session", submission_id=submission_id, contract_version="1", semantic_fingerprint=submission_id[0] * 64, payload={"text": "allowed"})
             claim = db.claim_prompt_submission_work(work["work_id"], owner_token=f"owner-{submission_id}")
             attempt = f"attempt-{submission_id}"
-            db.mark_prompt_submission_invoking(work["work_id"], owner_token=f"owner-{submission_id}", attempt_token=attempt)
+            db.mark_prompt_submission_invoking(work["work_id"], owner_token=f"owner-{submission_id}", owner_generation=1, attempt_token=attempt)
             with db._lock:
                 db._conn.execute("UPDATE prompt_accepted_work SET lease_expires_at=? WHERE work_id=?", (expiry, work["work_id"]))
             db.recover_prompt_submission_work(now=50, live_owner_witnesses=[{"work_id": work["work_id"], "owner_generation": claim["owner_generation"] + generation_delta, "owner_token": f"owner-{submission_id}", "invocation_attempt_token": witness}])
@@ -348,11 +348,11 @@ def test_terminal_summary_rejects_hostile_value_in_every_safe_field(tmp_path, fi
     try:
         work = db.create_or_read_prompt_submission(session_id="stored-session", submission_id="terminal", contract_version="1", semantic_fingerprint="5" * 64, payload={"text": "allowed"})
         db.claim_prompt_submission_work(work["work_id"], owner_token="owner")
-        db.mark_prompt_submission_invoking(work["work_id"], owner_token="owner", attempt_token="attempt")
+        db.mark_prompt_submission_invoking(work["work_id"], owner_token="owner", owner_generation=1, attempt_token="attempt")
         summary = {"layer": "provider", "code": "storage_failed", "retryable": False, "safe_action": "start_new_submission"}
         summary[field] = hostile
         with pytest.raises(ValueError, match="invalid durable terminal summary"):
-            db.complete_prompt_submission_work(work["work_id"], owner_token="owner", attempt_token="attempt", state="TERMINAL_ERROR", safe_terminal=summary)
+            db.complete_prompt_submission_work(work["work_id"], owner_token="owner", owner_generation=1, attempt_token="attempt", state="TERMINAL_ERROR", safe_terminal=summary)
     finally:
         db.close()
 

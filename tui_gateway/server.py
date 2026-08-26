@@ -2305,7 +2305,7 @@ def _wait_agent_for_prompt(session: dict, rid: str, sid: str) -> dict | None:
     return _err(rid, 5032, err) if err else None
 
 
-def _start_agent_build(sid: str, session: dict) -> None:
+def _start_agent_build(sid: str, session: dict, silent_failure: bool | dict = False) -> None:
     """Start building the real AIAgent for a TUI session, once.
 
     Classic `hermes` shows the prompt before constructing AIAgent; the TUI used
@@ -2500,8 +2500,13 @@ def _start_agent_build(sid: str, session: dict) -> None:
             # _schedule_mcp_late_refresh. Cache-safe (pre-first-turn only).
             _schedule_mcp_late_refresh(sid, agent)
         except Exception as e:
-            current["agent_error"] = str(e)
-            _emit("error", sid, {"message": f"agent init failed: {e}"})
+            if silent_failure:
+                # PREPARING terminalizes through the durable safe boundary;
+                # arbitrary construction failures are never retained or emitted.
+                current["_durable_build_failed"] = True
+            else:
+                current["agent_error"] = str(e)
+                _emit("error", sid, {"message": f"agent init failed: {e}"})
         finally:
             if home_token is not None:
                 reset_hermes_home_override(home_token)
@@ -2546,12 +2551,14 @@ def _start_agent_build(sid: str, session: dict) -> None:
     build_thread.start()
 
 
-def _cleanup_durable_preinvocation_projection(session: dict, work_id: str, owner_token: str) -> None:
+def _cleanup_durable_preinvocation_projection(session: dict, work_id: str, owner_token: str, owner_generation: int) -> None:
     """Release an uninvoked durable claim and only this projection's live flag."""
     try:
         with _session_db(session) as db:
             if db is not None:
-                db.release_prompt_submission_dispatch(work_id, owner_token=owner_token)
+                db.release_prompt_submission_dispatch(
+                    work_id, owner_token=owner_token, owner_generation=owner_generation,
+                )
     except Exception:
         pass
     with session["history_lock"]:
@@ -2580,6 +2587,7 @@ def _durable_nonprovider_preflight(sid: str, session: dict) -> None:
 def _begin_durable_preparation(sid: str, session: dict, durable_context: dict[str, Any]) -> bool:
     """First runtime-side action: fence setup before changing live projection."""
     work_id, owner_token = durable_context["work_id"], durable_context["owner_token"]
+    owner_generation = durable_context["owner_generation"]
     prepare_token = str(uuid.uuid4())
     with _sessions_lock:
         with session["history_lock"]:
@@ -2590,7 +2598,8 @@ def _begin_durable_preparation(sid: str, session: dict, durable_context: dict[st
             try:
                 with _session_db(session) as db:
                     prepared = db is not None and db.mark_prompt_submission_preparing(
-                        work_id, owner_token=owner_token, prepare_token=prepare_token,
+                        work_id, owner_token=owner_token, owner_generation=owner_generation,
+                        prepare_token=prepare_token,
                     )
             except Exception:
                 return False
@@ -2603,10 +2612,37 @@ def _begin_durable_preparation(sid: str, session: dict, durable_context: dict[st
             return True
 
 
+def _start_durable_preparation_lease_guard(session: dict, durable_context: dict[str, Any]) -> None:
+    """Keep the exact PREPARING fence leased until provider promotion."""
+    stop = threading.Event()
+    durable_context["_preparation_lease_stop"] = stop
+
+    def renew() -> None:
+        while not stop.wait(5.0):
+            try:
+                with _session_db(session) as db:
+                    if db is None or not db.renew_prompt_submission_preparing_lease(
+                        durable_context["work_id"], owner_token=durable_context["owner_token"],
+                        owner_generation=durable_context["owner_generation"],
+                        prepare_token=durable_context["prepare_token"],
+                    ):
+                        return
+            except Exception:
+                return
+    _RealThread(target=renew, daemon=True).start()
+
+
+def _stop_durable_preparation_lease_guard(durable_context: dict[str, Any]) -> None:
+    stop = durable_context.pop("_preparation_lease_stop", None)
+    if stop is not None:
+        stop.set()
+
+
 def _begin_durable_invocation(
     sid: str, session: dict, durable_context: dict[str, Any], text: Any,
 ) -> str:
     """Promote exact PREPARING owner to provider intent under full lock order."""
+    _stop_durable_preparation_lease_guard(durable_context)
     del text  # Keep the boundary explicit without retaining prompt material.
     work_id = durable_context["work_id"]
     owner_token = durable_context["owner_token"]
@@ -2627,20 +2663,23 @@ def _begin_durable_invocation(
                 with _session_db(session) as durable_db:
                     if durable_context.get("prepare_token"):
                         invoking = durable_db is not None and durable_db.mark_prompt_submission_invoking_from_preparing(
-                            work_id, owner_token=owner_token, prepare_token=durable_context["prepare_token"],
+                            work_id, owner_token=owner_token, owner_generation=durable_context["owner_generation"],
+                            prepare_token=durable_context["prepare_token"],
                             attempt_token=attempt_token,
                         )
                     else:
                         # Compatibility for direct legacy callers; scheduler v1
                         # always supplies a preparation fence.
                         invoking = durable_db is not None and durable_db.mark_prompt_submission_invoking(
-                            work_id, owner_token=owner_token, attempt_token=attempt_token,
+                            work_id, owner_token=owner_token, owner_generation=durable_context["owner_generation"],
+                            attempt_token=attempt_token,
                         )
                     if invoking is None:
                         return "preinvocation"
                     durable_context["attempt_token"] = attempt_token
                     running = durable_db.mark_prompt_submission_running(
-                        work_id, owner_token=owner_token, attempt_token=attempt_token,
+                        work_id, owner_token=owner_token, owner_generation=durable_context["owner_generation"],
+                        attempt_token=attempt_token,
                     )
             except Exception:
                 # A failed INVOKING write is still releasable; a RUNNING write
@@ -2680,7 +2719,8 @@ def _refuse_durable_preprovider_projection(
                 session["running"] = False
     else:
         _cleanup_durable_preinvocation_projection(
-            session, durable_context["work_id"], durable_context["owner_token"]
+            session, durable_context["work_id"], durable_context["owner_token"],
+            durable_context["owner_generation"],
         )
     if started:
         _emit("message.complete", sid, {
@@ -2693,6 +2733,7 @@ def _settle_durable_terminal(
     session: dict, durable_context: dict[str, Any], *, state: str,
     failure_code: str = "provider_failed",
 ) -> bool:
+    _stop_durable_preparation_lease_guard(durable_context)
     safe_terminal = None if state == "COMPLETED" else {
         "layer": "runtime" if failure_code == "local_runtime_failed" else "provider" if state == "TERMINAL_ERROR" else "recovery",
         "code": failure_code if state == "TERMINAL_ERROR" else "unknown_outcome",
@@ -2706,12 +2747,14 @@ def _settle_durable_terminal(
             if durable_context.get("attempt_token"):
                 return db.complete_prompt_submission_work(
                     durable_context["work_id"], owner_token=durable_context["owner_token"],
+                    owner_generation=durable_context["owner_generation"],
                     attempt_token=durable_context["attempt_token"], state=state,
                     safe_terminal=safe_terminal,
                 )
             if durable_context.get("prepare_token"):
                 return db.complete_prompt_submission_preparing(
                     durable_context["work_id"], owner_token=durable_context["owner_token"],
+                    owner_generation=durable_context["owner_generation"],
                     prepare_token=durable_context["prepare_token"], state=state,
                     safe_terminal=safe_terminal,
                 )
@@ -2800,10 +2843,11 @@ def _schedule_durable_prompt_projection(session: dict, work_id: str) -> None:
                 return
             # PREPARING is committed: runtime construction may now have effects,
             # but no provider intent exists until the later promotion.
+            _start_durable_preparation_lease_guard(session, durable_context)
             _emit("message.start", sid)
             durable_context["_message_started"] = True
-            _start_agent_build(sid, session)
-            if _wait_agent_for_prompt(session, f"__durable__{work_id}", sid) is not None:
+            _start_agent_build(sid, session, True)
+            if session.pop("_durable_build_failed", False) or _wait_agent_for_prompt(session, f"__durable__{work_id}", sid) is not None:
                 _emit_durable_safe_failure(
                     sid, session, durable_context, "", state="TERMINAL_ERROR",
                     failure_code="local_runtime_failed",
